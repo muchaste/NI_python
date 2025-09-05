@@ -63,16 +63,21 @@ class DataAcquisition:
         self.running = False
 
         self.recording_active = False
-        self.acquired_samples = 0
+        self.acquired_samples = 0  # Cumulative sample counter (int limit ~2.1B samples)
+        self.split_samples = 0  # Sample counter for current split file
         self.samples_to_save = 0
         self.recording_complete_callback = None
         self.recording_start_timestamp = None
+        self.session_start_timestamp = None  # Start time of entire recording session
+        self.target_split_samples = 0  # Exact samples per split file
         self.logfile_written = False
         self.logfile_callback = None
 
     def start(self):
         self.running = True
         self.recording_start_timestamp = None
+        self.session_start_timestamp = None
+        self.split_samples = 0
         self.logfile_written = False
         self.ai_task.start()
 
@@ -83,6 +88,8 @@ class DataAcquisition:
             if self.recording_complete_callback is not None:
                 self.recording_complete_callback()
         self.recording_start_timestamp = None
+        self.session_start_timestamp = None
+        self.split_samples = 0
         try:
             self.ai_task.stop()
             self.ai_task.close()
@@ -104,30 +111,76 @@ class DataAcquisition:
         # Extend buffers per channel
         for ch_idx in range(self.num_channels):
             self.plot_buffer[ch_idx].extend(temp_data[ch_idx])
+        
         if self.recording_active:
             n_samples = temp_data.shape[1]
             if self.recording_start_timestamp is None:
-                self.recording_start_timestamp = time.time() - (n_samples - 1) / self.sample_rate
+                current_time = time.time()
+                self.recording_start_timestamp = current_time - (n_samples - 1) / self.sample_rate
+                # Set session start timestamp only once for the entire recording session
+                if self.session_start_timestamp is None:
+                    self.session_start_timestamp = self.recording_start_timestamp
+                # Reset split sample counter when new recording/split starts
+                self.split_samples = 0
             if not self.logfile_written and self.recording_start_timestamp is not None:
                 if self.logfile_callback:
                     self.logfile_callback()
                 self.logfile_written = True
-            if self.acquired_samples + n_samples >= self.samples_to_save:
-                diff = (self.acquired_samples + n_samples) - self.samples_to_save
-                n_samples = n_samples - diff
+            
+            # Check if we need to limit samples to not exceed total recording duration
+            if self.acquired_samples + n_samples > self.samples_to_save:
+                # Limit samples to exactly reach the target
+                n_samples = self.samples_to_save - self.acquired_samples
                 temp_data = temp_data[:, :n_samples]
                 recording_complete = True
             else:
                 recording_complete = False
-
-            for ch_idx in range(self.num_channels):
-                self.storage_buffer[ch_idx].extend(temp_data[ch_idx])
-            self.acquired_samples += n_samples
-
+            
+            # Handle precise file splitting for split files
+            if hasattr(self, 'target_split_samples') and self.target_split_samples > 0:
+                # Check if we need to split this data chunk
+                if self.split_samples + n_samples > self.target_split_samples:
+                    # Split the data: exact samples for current file, excess for next
+                    samples_for_current = self.target_split_samples - self.split_samples
+                    current_data = temp_data[:, :samples_for_current]
+                    excess_data = temp_data[:, samples_for_current:n_samples]
+                    
+                    # Store exact samples for current file
+                    for ch_idx in range(self.num_channels):
+                        self.storage_buffer[ch_idx].extend(current_data[ch_idx])
+                    self.split_samples += samples_for_current
+                    
+                    # The excess will be handled by the GUI split logic
+                    # Store excess data temporarily
+                    self._excess_data = excess_data
+                    self._excess_samples = excess_data.shape[1]
+                    
+                    # Update acquired samples with the samples actually stored
+                    self.acquired_samples += samples_for_current
+                else:
+                    # Normal processing - all samples go to current file
+                    for ch_idx in range(self.num_channels):
+                        self.storage_buffer[ch_idx].extend(temp_data[ch_idx])
+                    self.split_samples += n_samples
+                    self._excess_data = None
+                    self._excess_samples = 0
+                    
+                    # Update acquired samples
+                    self.acquired_samples += n_samples
+            else:
+                # No splitting - normal processing
+                for ch_idx in range(self.num_channels):
+                    self.storage_buffer[ch_idx].extend(temp_data[ch_idx])
+                self.split_samples += n_samples
+                
+                # Update acquired samples
+                self.acquired_samples += n_samples
+                
             if recording_complete:
                 self.recording_active = False
                 if self.recording_complete_callback is not None:
                     self.recording_complete_callback()
+        return 0
         return 0
 
 # ---------------- File Writing Module ----------------
@@ -410,22 +463,37 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         else:
             self.specPlotWidget.clear()
 
-        # File splitting logic
-        if getattr(self, 'split_enabled', False) and self.acq and self.acq.acquired_samples > 0:
+        # File splitting logic - precise sample counting
+        if getattr(self, 'split_enabled', False) and self.acq and self.acq.split_samples >= self.acq.target_split_samples:
             if self.next_split_idx < len(self.split_points):
-                next_split = self.split_points[self.next_split_idx]
-                if self.acq.acquired_samples >= next_split:
-                    if self.file_writer is not None:
-                        self.file_writer.stop()
-                        self.file_writer.join()
-                    self.save_log_file()
-                    self.split_counter += 1
-                    self.record_filepath = self._split_filename()
-                    self.file_writer = FileWriter(self.acq.storage_buffer, self.buffer_lock, self.record_filepath, self.acq.sample_rate)
-                    self.file_writer.start()
-                    self.acq.logfile_written = False
-                    self.acq.recording_start_timestamp = None
-                    self.next_split_idx += 1
+                # Stop current file writer
+                if self.file_writer is not None:
+                    self.file_writer.stop()
+                    self.file_writer.join()
+                self.save_log_file()
+                
+                # Calculate precise start time for next split
+                split_duration_actual = self.acq.target_split_samples / self.acq.sample_rate
+                next_start_time = self.acq.session_start_timestamp + (self.split_counter * split_duration_actual)
+                
+                # Setup next split file
+                self.split_counter += 1
+                self.record_filepath = self._split_filename()
+                self.file_writer = FileWriter(self.acq.storage_buffer, self.buffer_lock, self.record_filepath, self.acq.sample_rate)
+                self.file_writer.start()
+                self.acq.logfile_written = False
+                self.acq.recording_start_timestamp = next_start_time  # Precise timestamp
+                self.acq.split_samples = 0  # Reset split sample counter
+                
+                # Handle excess data from previous split
+                if hasattr(self.acq, '_excess_data') and self.acq._excess_data is not None:
+                    for ch_idx in range(self.acq.num_channels):
+                        self.acq.storage_buffer[ch_idx].extend(self.acq._excess_data[ch_idx])
+                    self.acq.split_samples += self.acq._excess_samples
+                    self.acq._excess_data = None
+                    self.acq._excess_samples = 0
+                
+                self.next_split_idx += 1
 
     def start_record(self):
         self.recordBtn.setEnabled(False)
@@ -457,6 +525,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
                 self.recordBtn.setEnabled(True)
                 return
             self.split_samples = int(self.split_duration * self.acq.sample_rate)
+            self.acq.target_split_samples = self.split_samples  # Set exact target for DataAcquisition
             self.split_counter = 1
             self.base_filepath = os.path.splitext(filepath)[0]
             self.record_filepath = self._split_filename()
@@ -467,6 +536,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             self.split_points = [self.split_samples * i for i in range(1, int(np.ceil(total_samples / self.split_samples)))]
             self.next_split_idx = 0
         else:
+            self.acq.target_split_samples = 0  # No splitting
             self.record_filepath = filepath
             with open(self.record_filepath, 'wb'):
                 pass

@@ -94,11 +94,11 @@ def generate_sine_wave(freq, sample_rate, amp_factor):
 # ---------------- Audio Output Module ----------------
 class AudioStreamer:
     """Manages real-time audio output of incoming DAQ data."""
-    def __init__(self, daq_sample_rate, audio_sample_rate=48000, buffer_size=2048):
+    def __init__(self, daq_sample_rate, audio_sample_rate=24000, buffer_size=4096):
         self.daq_sample_rate = daq_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.buffer_size = buffer_size
-        self.audio_queue = queue.Queue(maxsize=50)  # Limit queue size to prevent memory buildup
+        self.audio_queue = queue.Queue(maxsize=10)  # Smaller queue for lower latency
         self.stream = None
         self.running = False
         self.needs_resampling = (daq_sample_rate != audio_sample_rate)
@@ -108,26 +108,38 @@ class AudioStreamer:
             self.resample_ratio = audio_sample_rate / daq_sample_rate
         else:
             self.resample_ratio = 1.0
+        
+        # Internal buffer to accumulate partial data
+        self.internal_buffer = np.array([], dtype=np.float32)
     
     def audio_callback(self, outdata, frames, time_info, status):
         """Callback for sounddevice output stream."""
         if status:
             print(f"Audio status: {status}")
         
-        try:
-            # Get data from queue (non-blocking)
-            data = self.audio_queue.get_nowait()
-            
-            # If data is shorter than required, pad with zeros
-            if len(data) < frames:
-                data = np.pad(data, (0, frames - len(data)), mode='constant')
-            elif len(data) > frames:
-                data = data[:frames]
-            
-            outdata[:] = data.reshape(-1, 1)  # Mono output
-        except queue.Empty:
-            # No data available, output silence
-            outdata.fill(0)
+        # Try to fill internal buffer from queue
+        while len(self.internal_buffer) < frames:
+            try:
+                # Get data from queue with short timeout
+                new_data = self.audio_queue.get(timeout=0.001)
+                self.internal_buffer = np.concatenate([self.internal_buffer, new_data])
+            except queue.Empty:
+                # If we don't have enough data, break and use what we have
+                break
+        
+        # Extract requested frames from internal buffer
+        if len(self.internal_buffer) >= frames:
+            outdata[:] = self.internal_buffer[:frames].reshape(-1, 1)
+            self.internal_buffer = self.internal_buffer[frames:]
+        else:
+            # Not enough data - output what we have and pad with zeros
+            available = len(self.internal_buffer)
+            if available > 0:
+                outdata[:available] = self.internal_buffer.reshape(-1, 1)
+                outdata[available:] = 0
+                self.internal_buffer = np.array([], dtype=np.float32)
+            else:
+                outdata.fill(0)
     
     def start(self):
         """Start audio streaming."""
@@ -172,6 +184,9 @@ class AudioStreamer:
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
+        
+        # Clear internal buffer
+        self.internal_buffer = np.array([], dtype=np.float32)
     
     def add_data(self, data):
         """Add new data to audio buffer (called from DAQ callback)."""
@@ -189,16 +204,12 @@ class AudioStreamer:
         else:
             resampled_data = normalized_data
         
-        # Add to queue (non-blocking, drop if full)
+        # Add to queue (non-blocking, drop newest if full to prevent buildup)
         try:
             self.audio_queue.put_nowait(resampled_data)
         except queue.Full:
-            # Drop oldest data and try again
-            try:
-                self.audio_queue.get_nowait()
-                self.audio_queue.put_nowait(resampled_data)
-            except:
-                pass  # Skip this chunk if still can't add
+            # Queue is full - just drop this chunk to prevent accumulating delay
+            pass
 
 # ---------------- Data Acquisition Module ----------------
 class DataAcquisition:
@@ -249,7 +260,7 @@ class DataAcquisition:
         self.test_signal_task = None
         
         # Audio output
-        self.audio_streamer = AudioStreamer(sample_rate) if AUDIO_AVAILABLE else None
+        self.audio_streamer = AudioStreamer(sample_rate, sample_rate) if AUDIO_AVAILABLE else None
         self.audio_enabled = False
 
     def start(self):
@@ -503,17 +514,17 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.daqCombo = QtWidgets.QComboBox()
         self.daqCombo.addItems(daqList)
         daq_layout.addRow("Select DAQ:", self.daqCombo)
-        self.chanEdit = QtWidgets.QLineEdit("ai0")
+        self.chanEdit = QtWidgets.QLineEdit("ai5,ai2")
         daq_layout.addRow("Input Channel(s):", self.chanEdit)
         self.outputChanEdit = QtWidgets.QLineEdit("ao0")
         daq_layout.addRow("Output Channel:", self.outputChanEdit)
-        self.sampleRateEdit = QtWidgets.QLineEdit("20000")
+        self.sampleRateEdit = QtWidgets.QLineEdit("40000")
         daq_layout.addRow("Sample Rate (Hz):", self.sampleRateEdit)
         self.daqGroup.setLayout(daq_layout)
         controls_layout.addWidget(self.daqGroup)
 
         # Plot Settings
-        self.plotGroup = QtWidgets.QGroupBox("Plot Settings")
+        self.plotGroup = QtWidgets.QGroupBox("Data Settings")
         plot_layout = QtWidgets.QFormLayout()
         self.plotDurEdit = QtWidgets.QLineEdit("1")
         plot_layout.addRow("Plot Duration (s):", self.plotDurEdit)

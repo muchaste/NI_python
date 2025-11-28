@@ -451,6 +451,7 @@ class AnalysisGUI:
         lag = self.lag.get()
         pre_stim_samples = pre_stim_duration * sample_rate
         stim_samples = stim_duration * sample_rate
+        window_size = sample_rate  # 1 second windows
         # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
@@ -466,7 +467,7 @@ class AnalysisGUI:
             period_length = end - start
             
             # Handle short periods (< 1s) by using the entire period as one window
-            if period_length < sample_rate:
+            if period_length < int(sample_rate*window_size):
                 # If period is too short for meaningful FFT (< 100ms or < 2 cycles), use NaN
                 min_samples = max(int(0.1 * sample_rate), int(2 * sample_rate / fish_freq))
                 if period_length < min_samples:
@@ -480,12 +481,12 @@ class AnalysisGUI:
                     )
             else:
                 # For longer periods, use 1s sliding windows
-                time_windows = np.arange(start, end, sample_rate)  # 1s windows
+                time_windows = np.arange(start, end, int(sample_rate*window_size))  # 1s windows
                 dom_freqs = []
                 
                 for time_window in time_windows:
                     window_start = int(time_window)
-                    window_end = int(min(time_window + sample_rate, end))
+                    window_end = int(min(time_window + int(sample_rate*window_size), end))
                     window_length = window_end - window_start
                     
                     # Only compute if window has sufficient samples

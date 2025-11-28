@@ -61,6 +61,10 @@ class AnalysisGUI:
         
         Label(self.control_frame, text="Lag (s):", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
         Entry(self.control_frame, textvariable=self.lag, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+
+        Label(self.control_frame, text="Window Size (s):", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        self.window_size = DoubleVar(value=10.0)
+        Entry(self.control_frame, textvariable=self.window_size, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
         
         Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot, font=self.button_font).pack(anchor="w", padx=5, pady=15)
 
@@ -451,7 +455,7 @@ class AnalysisGUI:
         lag = self.lag.get()
         pre_stim_samples = pre_stim_duration * sample_rate
         stim_samples = stim_duration * sample_rate
-        window_size = sample_rate  # 1 second windows
+        window_size = int(self.window_size.get() * sample_rate)  # 1 second windows
         # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
@@ -467,7 +471,7 @@ class AnalysisGUI:
             period_length = end - start
             
             # Handle short periods (< 1s) by using the entire period as one window
-            if period_length < int(sample_rate*window_size):
+            if period_length < window_size:
                 # If period is too short for meaningful FFT (< 100ms or < 2 cycles), use NaN
                 min_samples = max(int(0.1 * sample_rate), int(2 * sample_rate / fish_freq))
                 if period_length < min_samples:
@@ -481,12 +485,12 @@ class AnalysisGUI:
                     )
             else:
                 # For longer periods, use 1s sliding windows
-                time_windows = np.arange(start, end, int(sample_rate*window_size))  # 1s windows
+                time_windows = np.arange(start, end, window_size)  # 1s windows
                 dom_freqs = []
                 
                 for time_window in time_windows:
                     window_start = int(time_window)
-                    window_end = int(min(time_window + int(sample_rate*window_size), end))
+                    window_end = int(min(time_window + window_size, end))
                     window_length = window_end - window_start
                     
                     # Only compute if window has sufficient samples

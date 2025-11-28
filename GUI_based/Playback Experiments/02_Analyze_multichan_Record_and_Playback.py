@@ -23,34 +23,50 @@ class AnalysisGUI:
         self.bandpass_width = IntVar(value=300)
         self.lp_cutoff = IntVar(value=400)
         self.hp_cutoff = IntVar(value=1200)
+        self.freq_band = IntVar(value=50)
+        self.lag = DoubleVar(value=2.0)
         self.log_data = None
         self.data = None
 
-        # Create plot area
-        self.plot_frame = Frame(self.root)
-        self.plot_frame.pack(side="top", fill="both", expand=True)
+        # Define fonts
+        self.label_font = ("TkDefaultFont", 11)
+        self.button_font = ("TkDefaultFont", 11)
+        self.entry_font = ("TkDefaultFont", 10)
 
-        # Create control area
+        # Create control area (left side)
         self.control_frame = Frame(self.root)
-        self.control_frame.pack(side="bottom", fill="x")
+        self.control_frame.pack(side="left", fill="y", padx=10, pady=10)
 
-        # Add controls
-        Button(self.control_frame, text="Load File", command=self.load_file).pack(side="left", padx=5, pady=5)
-        Checkbutton(self.control_frame, text="Subtract Stimulus", variable=self.subtract_stimulus_flag).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Threshold:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.threshold, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Stim Threshold:").pack(side="left", padx=5, pady=5)
-        # Entry(self.control_frame, textvariable=self.stim_threshold, width=10).pack(side="left", padx=5, pady=5)
-        Checkbutton(self.control_frame, text="Bandpass Filter", variable=self.bandpass_filter_flag).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Bandpass width (Hz):").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.bandpass_width, width=10).pack(side="left", padx=5, pady=5)
-        # Label(self.control_frame, text="Bandpass high cutoff (Hz):").pack(side="left", padx=5, pady=5)
-        # Entry(self.control_frame, textvariable=self.hp_cutoff, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="NFFT exponent:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.nfft, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="noverlap exponent:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.noverlap, width=10).pack(side="left", padx=5, pady=5)
-        Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot).pack(side="left", padx=5, pady=5)
+        # Add controls vertically
+        Button(self.control_frame, text="Load File", command=self.load_file, font=self.button_font).pack(anchor="w", padx=5, pady=5)
+        
+        Checkbutton(self.control_frame, text="Subtract Stimulus", variable=self.subtract_stimulus_flag, font=self.label_font).pack(anchor="w", padx=5, pady=5)
+        
+        Label(self.control_frame, text="Threshold:", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.threshold, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Checkbutton(self.control_frame, text="Bandpass Filter", variable=self.bandpass_filter_flag, font=self.label_font).pack(anchor="w", padx=5, pady=5)
+        
+        Label(self.control_frame, text="Bandpass width (Hz):", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.bandpass_width, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Label(self.control_frame, text="NFFT exponent:", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.nfft, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Label(self.control_frame, text="noverlap exponent:", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.noverlap, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Label(self.control_frame, text="Frequency Band (Hz):", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.freq_band, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Label(self.control_frame, text="Lag (s):", font=self.label_font).pack(anchor="w", padx=5, pady=(10, 0))
+        Entry(self.control_frame, textvariable=self.lag, width=15, font=self.entry_font).pack(anchor="w", padx=5, pady=(0, 5))
+        
+        Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot, font=self.button_font).pack(anchor="w", padx=5, pady=15)
+
+        # Create plot area (right side)
+        self.plot_frame = Frame(self.root)
+        self.plot_frame.pack(side="right", fill="both", expand=True)
 
         # Initialize plot
         self.fig, self.axes = plt.subplots(4, 1, figsize=(15, 8))
@@ -431,20 +447,60 @@ class AnalysisGUI:
         self.axes[2].set_ylim(min_freq, max_freq)
 
         # Plot statistics
+        frequency_band = self.freq_band.get()
+        lag = self.lag.get()
         pre_stim_samples = pre_stim_duration * sample_rate
         stim_samples = stim_duration * sample_rate
         # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
             "Pre-Stimulus": (0, pre_stim_samples),
-            "10s-Stimulus": (pre_stim_samples+sample_rate, pre_stim_samples + 11*sample_rate), # skip the first second
-            "Complete Stimulus": (pre_stim_samples+sample_rate, pre_stim_samples + stim_samples-2*sample_rate), # skip first and last second
+            "10s-Stimulus": (pre_stim_samples+int(lag*sample_rate), pre_stim_samples + int((lag+10)*sample_rate)), # skip the lag seconds
+            "Complete Stimulus": (pre_stim_samples+int(lag*sample_rate), pre_stim_samples + stim_samples - int(lag*sample_rate)), # skip first and last second
             "Post-Stimulus": (pre_stim_samples + stim_samples, total_samples)
         }
 
         stats = {}
         for period, (start, end) in periods.items():
-            dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, fish_freq-50, fish_freq+50)
+            # Calculate median dominant frequency from spectrogram over time windows of 1s
+            period_length = end - start
+            
+            # Handle short periods (< 1s) by using the entire period as one window
+            if period_length < sample_rate:
+                # If period is too short for meaningful FFT (< 100ms or < 2 cycles), use NaN
+                min_samples = max(int(0.1 * sample_rate), int(2 * sample_rate / fish_freq))
+                if period_length < min_samples:
+                    dom_freq = np.nan
+                else:
+                    dom_freq = self.compute_dominant_frequency(
+                        cumulated_cleaned_data[start:end], 
+                        sample_rate, 
+                        max(1, fish_freq-frequency_band), 
+                        fish_freq+frequency_band
+                    )
+            else:
+                # For longer periods, use 1s sliding windows
+                time_windows = np.arange(start, end, sample_rate)  # 1s windows
+                dom_freqs = []
+                
+                for time_window in time_windows:
+                    window_start = int(time_window)
+                    window_end = int(min(time_window + sample_rate, end))
+                    window_length = window_end - window_start
+                    
+                    # Only compute if window has sufficient samples
+                    min_samples = max(int(0.1 * sample_rate), int(2 * sample_rate / fish_freq))
+                    if window_length >= min_samples:
+                        dom_freq_window = self.compute_dominant_frequency(
+                            cumulated_cleaned_data[window_start:window_end], 
+                            sample_rate, 
+                            max(1, fish_freq-frequency_band), 
+                            fish_freq+frequency_band
+                        )
+                        dom_freqs.append(dom_freq_window)
+                
+                # Compute median only if we have valid windows
+                dom_freq = np.median(dom_freqs) if len(dom_freqs) > 0 else np.nan
             
             # Calculate median instantaneous frequency if data exists
             if len(instant_time) > 0:
@@ -461,7 +517,7 @@ class AnalysisGUI:
             # envelope_cov = np.std(envelope_cum_period) #/np.mean(envelope_cum))
             stats[period] = (dom_freq, freq_median)#, amp_cov_ch1, amp_cov_ch2, envelope_cov
 
-        stats_df = pd.DataFrame(stats, index=["Dominant Freq (spectrogram)", "Median Inst. Freq"]) #"Amp. CoV (envelope)","Amp. CoV (Ch 1)", "Amp. CoV (Ch 2)",
+        stats_df = pd.DataFrame(stats, index=["Median Dom. Freq. (spectro)", "Median Inst. Freq."]) #"Amp. CoV (envelope)","Amp. CoV (Ch 1)", "Amp. CoV (Ch 2)",
         stats_df = stats_df.round(2)
         self.axes[3].axis("off")
         table = self.axes[3].table(

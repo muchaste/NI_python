@@ -343,8 +343,17 @@ class DataAcquisition:
             
             # Check if playback recording is complete
             if self.playback_active and time.time() - self.playback_start_time > self.playback_total_duration:
+                # Stop playback but don't cleanup immediately (will be done before next recording)
+                if self.ao_task is not None:
+                    try:
+                        self.ao_task.stop()
+                        # Write zeros to clear output
+                        zero_signal = np.repeat(0, int(self.sample_rate * 0.1))
+                        self.ao_task.write(zero_signal, auto_start=True)
+                        self.ao_task.stop()
+                    except:
+                        pass
                 self.playback_active = False
-                self.stop_playback()
                 
             if recording_complete:
                 self.recording_active = False
@@ -356,6 +365,9 @@ class DataAcquisition:
         """Start synchronized playback with recording."""
         if self.output_channel is None or self.daq_device is None:
             raise ValueError("Output channel and DAQ device must be specified for playback")
+        
+        # Force cleanup any existing output task to prevent resource conflicts
+        self.force_cleanup_output()
         
         self.playback_active = True
         self.playback_total_duration = total_duration
@@ -390,9 +402,27 @@ class DataAcquisition:
                 self.ao_task.write(zero_signal, auto_start=True)
                 self.ao_task.stop()
                 self.ao_task.close()
-                self.ao_task = None
             except Exception as e:
                 print("Error stopping playback:", e)
+                # Force close even if stop/write failed
+                try:
+                    if self.ao_task is not None:
+                        self.ao_task.close()
+                except:
+                    pass
+            finally:
+                self.ao_task = None
+        self.playback_active = False
+    
+    def force_cleanup_output(self):
+        """Force cleanup of output task to prevent resource conflicts."""
+        if self.ao_task is not None:
+            try:
+                self.ao_task.close()
+            except Exception as e:
+                print(f"Force cleanup output task: {e}")
+            finally:
+                self.ao_task = None
         self.playback_active = False
     
     def start_test_signal(self, amplitude):
@@ -823,6 +853,13 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
     def start_record(self):
         """Start recording with synchronized playback stimulus."""
         self.recordBtn.setEnabled(False)
+        
+        # Ensure any previous output task is fully cleaned up
+        if self.acq is not None:
+            self.acq.force_cleanup_output()
+            # Small delay to ensure hardware releases resources
+            QtCore.QThread.msleep(50)
+        
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Playback Data", "", "Binary files (*.bin)")
         if not filepath:
             self.recordBtn.setEnabled(True)

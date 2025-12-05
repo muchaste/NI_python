@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
+from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame
 import os
 from scipy.signal import detrend, hilbert, butter, filtfilt
 
@@ -23,7 +23,6 @@ class AnalysisGUI:
         self.bandpass_width = IntVar(value=300)
         self.lp_cutoff = IntVar(value=400)
         self.hp_cutoff = IntVar(value=1200)
-        self.freq_band = IntVar(value=50)
         self.log_data = None
         self.data = None
 
@@ -51,8 +50,6 @@ class AnalysisGUI:
         Entry(self.control_frame, textvariable=self.nfft, width=10).pack(side="left", padx=5, pady=5)
         Label(self.control_frame, text="noverlap exponent:").pack(side="left", padx=5, pady=5)
         Entry(self.control_frame, textvariable=self.noverlap, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Frequency Band (Hz):").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.freq_band, width=10).pack(side="left", padx=5, pady=5)
         Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot).pack(side="left", padx=5, pady=5)
 
         # Initialize plot
@@ -72,53 +69,25 @@ class AnalysisGUI:
         with open(log_filepath, 'r') as file:
             log_data = {line.split(": ")[0]: line.split(": ")[1].strip() for line in file.readlines()}
 
-        # Construct data filepath from log filepath
-        data_filepath = log_filepath.replace('log_', '').replace('.txt', '.bin')
+        # data_filepath = log_data['Path to Datafile']
+        data_filepath = log_filepath.split('log_')[0]+log_filepath.split('log_')[-1].split('.')[0]+'.feather'
 
         if not os.path.exists(data_filepath):
             raise FileNotFoundError(f"Data file not found at: {data_filepath}")
 
-        # Load binary data
-        n_channels = int(log_data['N_Input_Channels'])
-        sample_rate = int(log_data['Sample_Rate'])
-        
-        # Binary file format: interleaved columns [time_ms, ch0, ch1, ...]
-        # Read as float64 (default for numpy tofile)
-        raw_data = np.fromfile(data_filepath, dtype=np.float64)
-        
-        # Reshape into columns: time, ch0, ch1, ...
-        n_cols = n_channels + 1  # time + channels
-        n_rows = len(raw_data) // n_cols
-        data_array = raw_data[:n_rows * n_cols].reshape((n_rows, n_cols))
-        
-        # Create DataFrame with proper column names
-        column_names = ["Time [ms]"] + [f"ch {i}" for i in range(n_channels)]
-        data = pd.DataFrame(data_array, columns=column_names)
-        
+        data = pd.read_feather(data_filepath)
         return log_data, data
 
     def bandpass_filter(self, data, fs, lowcut, highcut, order=4):
         """
         Returns a bandpass-filtered version of data, with passband = [lowcut, highcut].
-        If lowcut is too low (< 10 Hz), applies lowpass filter instead.
-        Returns (filtered_data, was_bandpass_applied)
         """
         nyquist = 0.5 * fs
-        
-        # Check if lowcut is too low for bandpass filtering
-        if lowcut < 10:
-            # Use lowpass filter instead
-            high = highcut / nyquist
-            b, a = butter(order, high, btype='low')
-            filtered_data = filtfilt(b, a, data)
-            return filtered_data, False
-        else:
-            # Use bandpass filter
-            low = lowcut / nyquist
-            high = highcut / nyquist
-            b, a = butter(order, [low, high], btype='band')
-            filtered_data = filtfilt(b, a, data)
-            return filtered_data, True
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = butter(order, [low, high], btype='band')
+        filtered_data = filtfilt(b, a, data)
+        return filtered_data
 
     def inst_freq(self, y, fs,
                      zero_threshold=0.0,
@@ -141,10 +110,6 @@ class AnalysisGUI:
         zerocross_idx = zerocross_idx[keep]
         amp_step = amp_step[keep]
 
-        # Check if we have any zero crossings left
-        if len(zerocross_idx) == 0:
-            return np.array([]), np.array([])
-
         amp_frac = (0 - y[zerocross_idx]) / amp_step
         y_frac = zerocross_idx + amp_frac
 
@@ -153,10 +118,6 @@ class AnalysisGUI:
         if min_interval > 0:
             # e.g., skip intervals that are less than half of your expected fundamental period
             crossing_intervals = crossing_intervals[crossing_intervals >= min_interval]
-
-        # Check if we have any intervals left
-        if len(crossing_intervals) == 0:
-            return np.array([]), np.array([])
 
         inst_f = 1.0 / crossing_intervals
         tinst_f = np.cumsum(crossing_intervals) + (y_frac[0] / fs)
@@ -302,13 +263,13 @@ class AnalysisGUI:
             ax.clear()
 
         # Extract key parameters
-        sample_rate = int(self.log_data["Sample_Rate"])
-        pre_stim_duration = int(self.log_data["Pre_Stimulus_Duration"])
-        stim_duration = int(self.log_data["Stimulus_Duration"])
-        # post_stim_duration = int(self.log_data["Post_Stimulus_Duration"])
-        fish_id = self.log_data["Fish_ID"]
-        fish_freq = float(self.log_data["Dominant_Frequency"])
-        frequency_offset = self.log_data["Frequency_Offset"]
+        sample_rate = int(self.log_data["Sample Rate"])
+        pre_stim_duration = int(self.log_data["Pre Stimulus Duration"])
+        stim_duration = int(self.log_data["Stimulus Duration"])
+        # post_stim_duration = int(self.log_data["Post Stimulus Duration"])
+        fish_id = self.log_data["Fish ID"]
+        fish_freq = float(self.log_data["Dominant frequency"])
+        frequency_offset = self.log_data["Frequency Offset"]
         try:
             temperature = float(self.log_data["Temperature"])
         except KeyError:
@@ -324,7 +285,7 @@ class AnalysisGUI:
 
         # Detrend raw data
         channel_1 = detrend(self.data["ch 0"])
-        stimulus = detrend(self.data["ch 1"])
+        channel_2 = detrend(self.data["ch 1"])
         # channel_3 = detrend(self.data["ch 2"])  # Stimulus
 
         # Cumulated data
@@ -335,7 +296,7 @@ class AnalysisGUI:
         amp_facts = np.arange(1,61)
         lag_range = np.arange(1,51)
         if self.subtract_stimulus_flag.get():
-            cumulated_cleaned_data = self.subtract_stim(channel_1, stimulus, pre_stim_duration, pre_stim_duration+stim_duration, sample_rate, lag_range, amp_facts)
+            cumulated_cleaned_data = self.subtract_stim(channel_1, channel_2, pre_stim_duration, pre_stim_duration+stim_duration, sample_rate, lag_range, amp_facts)
             # cleaned_2 = self.subtract_stim(channel_2, channel_3, pre_stim_duration, pre_stim_duration+stim_duration, sample_rate, lag_range, amp_facts)
         else:
             cumulated_cleaned_data = channel_1
@@ -352,8 +313,8 @@ class AnalysisGUI:
         self.axes[0].legend(loc="lower left")
 
         # Plot spectrogram
-        min_freq = float(self.log_data["Min_Frequency"])
-        max_freq = float(self.log_data["Max_Frequency"])
+        min_freq = float(self.log_data["Min Frequency"])
+        max_freq = float(self.log_data["Max Frequency"])
         nfft_exp = self.nfft.get()
         nfft_value = 2**nfft_exp
         noverlap_exp = self.noverlap.get()
@@ -373,91 +334,50 @@ class AnalysisGUI:
 
         # 1) Optional bandpass filter
         if self.bandpass_filter_flag.get():
-            low_freq = round(float(self.log_data['Dominant_Frequency'])) - self.bandpass_width.get()/2
-            high_freq = round(float(self.log_data['Dominant_Frequency'])) + self.bandpass_width.get()/2
-            low_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) - self.bandpass_width.get()/2
-            high_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) + self.bandpass_width.get()/2
-            
-            # Filter fish signal
-            cumulated_cleaned_data_filtered, fish_bandpass_applied = self.bandpass_filter(cumulated_cleaned_data, sample_rate, low_freq, high_freq)
-            cumulated_cleaned_data_filtered = detrend(cumulated_cleaned_data_filtered)
-            
-            # Filter stimulus signal
-            stim_data_filtered, stim_bandpass_applied = self.bandpass_filter(stimulus, sample_rate, low_freq_stim, high_freq_stim)
-            stim_data_filtered = detrend(stim_data_filtered)
-            
-            # Show popup if bandpass couldn't be applied
-            if not fish_bandpass_applied or not stim_bandpass_applied:
-                filter_info = []
-                if not fish_bandpass_applied:
-                    filter_info.append(f"Fish signal (low freq: {low_freq:.1f} Hz < 10 Hz)")
-                if not stim_bandpass_applied:
-                    filter_info.append(f"Stimulus signal (low freq: {low_freq_stim:.1f} Hz < 10 Hz)")
-                messagebox.showwarning(
-                    "Filtering Notice",
-                    f"Bandpass filtering was replaced with lowpass filtering for:\n" + "\n".join(filter_info) +
-                    f"\n\nLowpass cutoff frequencies: Fish={high_freq} Hz, Stimulus={high_freq_stim} Hz"
-                )
-            
+            low_freq = round(float(self.log_data['Dominant frequency'])) - self.bandpass_width.get()/2
+            high_freq = round(float(self.log_data['Dominant frequency'])) + self.bandpass_width.get()/2
+            low_freq_stim = round(float(self.log_data['Dominant frequency'])) + round(float(self.log_data['Frequency Offset'])) - self.bandpass_width.get()/2
+            high_freq_stim = round(float(self.log_data['Dominant frequency'])) + round(float(self.log_data['Frequency Offset'])) + self.bandpass_width.get()/2
+            # high_freq = self.hp_cutoff.get()
+            cumulated_cleaned_data_filtered = self.bandpass_filter(cumulated_cleaned_data, sample_rate, low_freq, high_freq)
+            stim_data_filtered = self.bandpass_filter(channel_2, sample_rate, low_freq_stim, high_freq_stim)
             instant_freq, instant_time = self.inst_freq(cumulated_cleaned_data_filtered, sample_rate, threshold)
             instant_freq_stim, instant_time_stim = self.inst_freq(stim_data_filtered, sample_rate, threshold)
         else:
             # zero_crossings = np.where(np.diff(np.sign(cumulated_data)))[0]
             instant_freq, instant_time = self.inst_freq(cumulated_cleaned_data, sample_rate, threshold)
-            instant_freq_stim, instant_time_stim = self.inst_freq(stimulus, sample_rate, threshold)
+            instant_freq_stim, instant_time_stim = self.inst_freq(channel_2, sample_rate, threshold)
 
 
-        # Filter stimulus instantaneous frequency to stimulus period only
-        if len(instant_time_stim) > 0:
-            stim_mask = np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]
-            instant_freq_stim = instant_freq_stim[stim_mask]
-            instant_time_stim = instant_time_stim[stim_mask]
+        instant_freq_stim = instant_freq_stim[np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]]
+        instant_time_stim = instant_time_stim[np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]]
 
         # zero_crossings = self.calculate_zero_crossings(cumulated_data, threshold)
         # instant_freq = sample_rate / np.diff(zero_crossings)
         # instant_time = zero_crossings[:-1] / sample_rate
-        
-        # Plot instantaneous frequency (only if data exists)
-        if len(instant_time) > 0:
-            self.axes[2].plot(instant_time, instant_freq,'.')
-        if len(instant_time_stim) > 0:
-            self.axes[2].plot(instant_time_stim, instant_freq_stim,'.')
-        
-        # Show warning if no data could be plotted
-        if len(instant_time) == 0 and len(instant_time_stim) == 0:
-            self.axes[2].text(0.5, 0.5, 'No zero crossings detected\nTry lowering the threshold or adjusting filter settings',
-                            ha='center', va='center', transform=self.axes[2].transAxes,
-                            fontsize=12, color='red')
+        self.axes[2].plot(instant_time, instant_freq,'.')
+        self.axes[2].plot(instant_time_stim, instant_freq_stim,'.')
         self.axes[2].set_title("Instantaneous Frequency")
         self.axes[2].set_ylabel("Frequency (Hz)")
         self.axes[2].set_xlabel("Time (s)")
         self.axes[2].set_ylim(min_freq, max_freq)
 
         # Plot statistics
-        frequency_band = self.freq_band.get()
         pre_stim_samples = pre_stim_duration * sample_rate
         stim_samples = stim_duration * sample_rate
         # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
             "Pre-Stimulus": (0, pre_stim_samples),
-            "10s-Stimulus": (pre_stim_samples+sample_rate, pre_stim_samples + 11*sample_rate), # skip the first second
-            "Complete Stimulus": (pre_stim_samples+sample_rate, pre_stim_samples + stim_samples-2*sample_rate), # skip first and last second
+            "10s-Stimulus": (pre_stim_samples, pre_stim_samples + 10*sample_rate),
+            "Complete Stimulus": (pre_stim_samples, pre_stim_samples + stim_samples),
             "Post-Stimulus": (pre_stim_samples + stim_samples, total_samples)
         }
 
         stats = {}
         for period, (start, end) in periods.items():
-            dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
-            
-            # Calculate median instantaneous frequency if data exists
-            if len(instant_time) > 0:
-                period_mask = (instant_time >= start / sample_rate) & (instant_time < end / sample_rate)
-                period_freqs = instant_freq[period_mask]
-                freq_median = np.median(period_freqs) if len(period_freqs) > 0 else np.nan
-            else:
-                freq_median = np.nan
-            
+            dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, fish_freq-9.9, fish_freq+9.9)
+            freq_median = np.median(instant_freq[(instant_time >= start / sample_rate) & (instant_time < end / sample_rate)])
             # temp = temperature
             # cond = conductivity
             # amp_cov_cum = np.abs(np.std(cumulated_cleaned_data[start:end]) / np.mean(cumulated_cleaned_data[start:end]))

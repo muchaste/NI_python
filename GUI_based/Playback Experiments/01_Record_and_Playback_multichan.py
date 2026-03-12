@@ -340,21 +340,7 @@ class DataAcquisition:
             
             # Update acquired samples
             self.acquired_samples += n_samples
-            
-            # Check if playback recording is complete
-            if self.playback_active and time.time() - self.playback_start_time > self.playback_total_duration:
-                # Stop playback but don't cleanup immediately (will be done before next recording)
-                if self.ao_task is not None:
-                    try:
-                        self.ao_task.stop()
-                        # Write zeros to clear output
-                        zero_signal = np.repeat(0, int(self.sample_rate * 0.1))
-                        self.ao_task.write(zero_signal, auto_start=True)
-                        self.ao_task.stop()
-                    except:
-                        pass
-                self.playback_active = False
-                
+
             if recording_complete:
                 self.recording_active = False
                 if self.recording_complete_callback is not None:
@@ -397,20 +383,16 @@ class DataAcquisition:
         if self.ao_task is not None:
             try:
                 self.ao_task.stop()
-                # Write zeros to clear output
                 zero_signal = np.repeat(0, int(self.sample_rate * 0.1))
                 self.ao_task.write(zero_signal, auto_start=True)
                 self.ao_task.stop()
-                self.ao_task.close()
             except Exception as e:
                 print("Error stopping playback:", e)
-                # Force close even if stop/write failed
-                try:
-                    if self.ao_task is not None:
-                        self.ao_task.close()
-                except:
-                    pass
             finally:
+                try:
+                    self.ao_task.close()
+                except Exception as e:
+                    print("Error closing ao_task:", e)
                 self.ao_task = None
         self.playback_active = False
     
@@ -887,7 +869,19 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Error", "No data available for frequency analysis.")
             self.recordBtn.setEnabled(True)
             return
-        
+
+        self.log_data = {
+            "fish_id": self.fishIdEdit.text(),
+            "temperature": self.tempEdit.text(),
+            "conductivity": self.condEdit.text(),
+            "pre_stim": pre_stim_duration,
+            "stim": stim_duration,
+            "post_stim": post_stim_duration,
+            "total_duration": total_duration,
+            "offset_frequency": self.offsetCombo.currentText(),
+            "amp_factor": self.ampFactorEdit.text(),
+        }
+
         # Generate synthetic playback signal
         playback_signal = generate_synthetic_signal(
             self.dominant_freq, offset_frequency, pre_stim_duration, 
@@ -918,15 +912,18 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.acq.start_playback(playback_signal, total_duration)
 
     def on_recording_complete(self):
+        if self.acq is not None:
+            self.acq.stop_playback()
         if self.file_writer is not None:
             self.file_writer.stop()
-            self.file_writer.join()
+            self.file_writer.join(timeout=10)
+            self.file_writer = None
         self.acq.recording_start_timestamp = None
         self.recordBtn.setEnabled(True)
-        
-        # Stop recording indicator
+        self.testSignalStartBtn.setEnabled(True)
+
         self.stop_recording_indicator()
-        
+
         gc.collect()
         QtWidgets.QMessageBox.information(self, "Finished", "Recording complete")
 
@@ -938,38 +935,36 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             timestamp_str = dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         else:
             timestamp_str = "N/A"
-        try:
-            pre_stim = int(self.preStimEdit.text())
-            stim = int(self.stimEdit.text())
-            post_stim = int(self.postStimEdit.text())
-            total_duration = pre_stim + stim + post_stim
-        except ValueError:
-            total_duration = "N/A"
-        
-        log_data = {
+
+        log_out = {
             "N_Input_Channels": self.acq.num_channels,
             "Sample_Rate": self.acq.sample_rate,
-            "Fish_ID": self.fishIdEdit.text(),
-            "Temperature": self.tempEdit.text(),
-            "Conductivity": self.condEdit.text(),
-            "Total_Recording_Duration": str(total_duration),
+            "Fish_ID": self.log_data["fish_id"],
+            "Temperature": self.log_data["temperature"],
+            "Conductivity": self.log_data["conductivity"],
+            "Total_Recording_Duration": str(self.log_data["total_duration"]),
             "Input_Channels": ', '.join(self.acq.input_channels),
             "Output_Channel": self.acq.output_channel if self.acq.output_channel else "N/A",
             "Recording_Start_Timestamp": timestamp_str,
             "Dominant_Frequency": getattr(self, 'dominant_freq', 'N/A'),
-            "Frequency_Offset": self.offsetCombo.currentText() if hasattr(self, 'dominant_freq') else "N/A",
+            "Frequency_Offset": self.log_data["offset_frequency"],
             "Min_Frequency": self.min_freq,
             "Max_Frequency": self.max_freq,
-            "Stimulus_Duration": self.stimEdit.text() if hasattr(self, 'dominant_freq') else "N/A",
-            "Pre_Stimulus_Duration": self.preStimEdit.text() if hasattr(self, 'dominant_freq') else "N/A",
-            "Post_Stimulus_Duration": self.postStimEdit.text() if hasattr(self, 'dominant_freq') else "N/A",
-            "Amplitude_Factor": self.ampFactorEdit.text() if hasattr(self, 'dominant_freq') else "N/A"
+            "Stimulus_Duration": str(self.log_data["stim"]),
+            "Pre_Stimulus_Duration": str(self.log_data["pre_stim"]),
+            "Post_Stimulus_Duration": str(self.log_data["post_stim"]),
+            "Amplitude_Factor": self.log_data["amp_factor"],
         }
         with open(log_filepath, 'w') as f:
-            for key, value in log_data.items():
+            for key, value in log_out.items():
                 f.write(f"{key}: {value}\n")
 
     def stop_acquisition(self):
+        self.stop_recording_indicator()
+        if self.file_writer is not None:
+            self.file_writer.stop()
+            self.file_writer.join(timeout=5)
+            self.file_writer = None
         if self.acq:
             self.acq.stop()
         self.plot_timer.stop()

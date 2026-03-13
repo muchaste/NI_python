@@ -5,6 +5,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
 import os
 from scipy.signal import detrend, hilbert, butter, filtfilt
+from scipy.ndimage import label as ndimage_label
 
 class AnalysisGUI:
 
@@ -28,6 +29,12 @@ class AnalysisGUI:
         self.freq_band = IntVar(value=50)
         self.log_data = None
         self.data = None
+        self.fm_threshold = DoubleVar(value=10.0)
+        self.fm_baseline_window = DoubleVar(value=1.0)
+        self.fm_min_duration = DoubleVar(value=5.0)
+        self.fm_events = None
+        self.instant_freq = np.array([])
+        self.instant_time = np.array([])
 
         # Main layout: controls left, plot right
         main_frame = Frame(self.root)
@@ -72,6 +79,24 @@ class AnalysisGUI:
         r += 1
         Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot).grid(
             row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        r += 1
+        Label(self.control_frame, text="─── FM Detection ───").grid(
+            row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=(8, 2))
+        r += 1
+        Label(self.control_frame, text="FM Threshold (Hz):").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.fm_threshold, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="Baseline Window (s):").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.fm_baseline_window, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="Min Duration (ms):").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.fm_min_duration, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Button(self.control_frame, text="Detect FMs", command=self.detect_fms).grid(
+            row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        r += 1
+        self.export_fm_button = Button(self.control_frame, text="Export FMs", command=self.export_fms, state="disabled")
+        self.export_fm_button.grid(row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
         self.control_frame.columnconfigure(1, weight=1)
 
         # Initialize plot
@@ -324,6 +349,12 @@ class AnalysisGUI:
             self.toolbar.mode = ''  # Reset active toolbar mode (zoom/pan)
             self.toolbar.update()  # Update the toolbar to reflect the change
 
+        self.fm_events = None
+        self.instant_freq = np.array([])
+        self.instant_time = np.array([])
+        if hasattr(self, 'export_fm_button'):
+            self.export_fm_button.config(state="disabled")
+
         # Clear previous plots
         for ax in self.axes:
             ax.clear()
@@ -444,6 +475,9 @@ class AnalysisGUI:
             instant_freq_stim, instant_time_stim = self.inst_freq(stimulus, sample_rate, threshold)
 
 
+        self.instant_freq = instant_freq
+        self.instant_time = instant_time
+
         # Filter stimulus instantaneous frequency to stimulus period only
         if len(instant_time_stim) > 0:
             stim_mask = np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]
@@ -465,7 +499,7 @@ class AnalysisGUI:
             self.axes[2].text(0.5, 0.5, 'No zero crossings detected\nTry lowering the threshold or adjusting filter settings',
                             ha='center', va='center', transform=self.axes[2].transAxes,
                             fontsize=12, color='red')
-        self.axes[2].set_title("Instantaneous Frequency")
+        self.axes[2].set_title("Instantaneous Frequency — click 'Detect FMs' to label events")
         self.axes[2].set_ylabel("Frequency (Hz)")
         self.axes[2].set_xlabel("Time (s)")
         self.axes[2].set_ylim(min_freq, max_freq)
@@ -534,6 +568,133 @@ class AnalysisGUI:
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
         self.toolbar.update()
         self.toolbar.pack(side="bottom", fill="x")
+
+    def detect_fms(self):
+        if len(self.instant_freq) == 0 or len(self.instant_time) == 0:
+            messagebox.showwarning("No Data", "No instantaneous frequency data available.\nLoad a file and refresh the plot first.")
+            return
+
+        fm_thr = self.fm_threshold.get()
+        baseline_win_s = self.fm_baseline_window.get()
+        min_dur_ms = self.fm_min_duration.get()
+        interp_dt = 0.001  # 1ms interpolation grid
+
+        reg_time = np.arange(self.instant_time[0], self.instant_time[-1], interp_dt)
+        reg_freq = np.interp(reg_time, self.instant_time, self.instant_freq)
+
+        win = max(1, int(baseline_win_s / interp_dt))
+        baseline = pd.Series(reg_freq).rolling(win, center=True, min_periods=1).median().values
+        deviation = reg_freq - baseline
+
+        above = (deviation > fm_thr).astype(int)
+        labeled_array, n_raw = ndimage_label(above)
+
+        TYPE_COLORS = {
+            "Type 1": "red",
+            "Type 2": "royalblue",
+            "Type 3": "darkorange",
+            "Rise": "green",
+            "Yodel": "purple",
+            "Yodel (trunc.)": "mediumpurple",
+            "Unclassified": "gray",
+        }
+
+        events = []
+        for i in range(1, n_raw + 1):
+            idxs = np.where(labeled_array == i)[0]
+            duration_ms = len(idxs) * interp_dt * 1000
+            if duration_ms < min_dur_ms:
+                continue
+
+            t_start = reg_time[idxs[0]]
+            t_end = reg_time[idxs[-1]]
+            peak_local = int(np.argmax(deviation[idxs]))
+            peak_idx = idxs[peak_local]
+            peak_hz = float(deviation[peak_idx])
+            peak_time = float(reg_time[peak_idx])
+            rise_time_ms = peak_local * interp_dt * 1000
+            fall_time_ms = (len(idxs) - 1 - peak_local) * interp_dt * 1000
+            rise_fraction = rise_time_ms / duration_ms if duration_ms > 0 else 0.5
+
+            post_start = idxs[-1] + 1
+            post_end = min(len(reg_time), post_start + int(0.1 / interp_dt))
+            undershoot_hz = float(deviation[post_start:post_end].min()) if post_end > post_start else 0.0
+            undershoot_hz = min(0.0, undershoot_hz)
+
+            # Event ends within 50ms of recording end → likely truncated
+            at_end = idxs[-1] >= len(reg_time) - int(0.05 / interp_dt)
+
+            # Classification based on frequency-time properties only.
+            # Amplitude reduction is not used — unreliable from summed/multi-electrode signal.
+            if fall_time_ms > 5000:
+                fm_type = "Yodel"
+            elif at_end and peak_hz >= 50:
+                fm_type = "Yodel (trunc.)"
+            elif peak_hz >= 100 and duration_ms > 150:
+                fm_type = "Type 3"
+            elif peak_hz >= 100 and duration_ms <= 150:
+                fm_type = "Type 1"
+            elif peak_hz <= 50 and duration_ms <= 50 and abs(rise_fraction - 0.5) < 0.25:
+                fm_type = "Type 2"
+            elif peak_hz <= 20 and duration_ms <= 50:
+                fm_type = "Rise"
+            else:
+                fm_type = "Unclassified"
+
+            events.append({
+                "type": fm_type,
+                "t_start": round(float(t_start), 4),
+                "t_end": round(float(t_end), 4),
+                "duration_ms": round(duration_ms, 2),
+                "peak_hz": round(peak_hz, 2),
+                "peak_time": round(peak_time, 4),
+                "rise_time_ms": round(rise_time_ms, 2),
+                "fall_time_ms": round(fall_time_ms, 2),
+                "rise_fraction": round(rise_fraction, 3),
+                "undershoot_hz": round(undershoot_hz, 3),
+                "color": TYPE_COLORS.get(fm_type, "gray"),
+            })
+
+        self.fm_events = events
+        self.export_fm_button.config(state="normal" if events else "disabled")
+        self.draw_fm_overlay()
+
+    def draw_fm_overlay(self):
+        if not self.fm_events:
+            self.axes[2].set_title("Instantaneous Frequency — 0 FM events detected")
+            if self.canvas is not None:
+                self.canvas.draw()
+            return
+
+        seen_types = set()
+        for ev in self.fm_events:
+            fm_type = ev["type"]
+            color = ev["color"]
+            self.axes[2].axvspan(ev["t_start"], ev["t_end"], alpha=0.2, color=color, zorder=1)
+            scatter_label = fm_type if fm_type not in seen_types else "_nolegend_"
+            peak_freq = float(np.interp(ev["peak_time"], self.instant_time, self.instant_freq))
+            self.axes[2].scatter(ev["peak_time"], peak_freq, c=color, s=50, zorder=5, label=scatter_label)
+            seen_types.add(fm_type)
+
+        self.axes[2].legend(loc="upper right", fontsize=8, markerscale=1.2)
+        n = len(self.fm_events)
+        self.axes[2].set_title(f"Instantaneous Frequency — {n} FM event{'s' if n != 1 else ''} detected")
+        self.fig.tight_layout()
+        if self.canvas is not None:
+            self.canvas.draw()
+
+    def export_fms(self):
+        if not self.fm_events:
+            return
+        filepath = filedialog.asksaveasfilename(
+            title="Save FM Events",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if filepath:
+            export_cols = ["type", "t_start", "t_end", "duration_ms", "peak_hz",
+                           "peak_time", "rise_time_ms", "fall_time_ms", "rise_fraction", "undershoot_hz"]
+            pd.DataFrame(self.fm_events)[export_cols].to_csv(filepath, index=False)
 
 if __name__ == "__main__":
     root = Tk()

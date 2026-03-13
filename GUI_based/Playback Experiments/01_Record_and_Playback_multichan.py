@@ -545,8 +545,10 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.daqCombo = QtWidgets.QComboBox()
         self.daqCombo.addItems(daqList)
         daq_layout.addRow("Select DAQ:", self.daqCombo)
-        self.chanEdit = QtWidgets.QLineEdit("ai5,ai2")
-        daq_layout.addRow("Input Channel(s):", self.chanEdit)
+        self.inputChanEdit = QtWidgets.QLineEdit("ai5,ai4")
+        daq_layout.addRow("Recording Input Channel(s):", self.inputChanEdit)
+        self.copyChanEdit = QtWidgets.QLineEdit("ai2")
+        daq_layout.addRow("Input Ch. Playback Copy:", self.copyChanEdit)
         self.outputChanEdit = QtWidgets.QLineEdit("ao0")
         daq_layout.addRow("Output Channel:", self.outputChanEdit)
         self.sampleRateEdit = QtWidgets.QLineEdit("40000")
@@ -701,7 +703,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
     def start_acquisition(self):
         device = self.daqCombo.currentText()
         # Accept comma or whitespace separated channels, strip whitespace
-        channel_text = self.chanEdit.text().strip()
+        input_channel_text = self.inputChanEdit.text().strip()
+        copy_channel_text = self.copyChanEdit.text().strip() if self.copyChanEdit.text().strip() else ""
+        channel_text = input_channel_text + ("," + copy_channel_text if copy_channel_text else "")
         channel_list = [f"{device}/{ch.strip()}" for ch in channel_text.replace(',', ' ').split()]
         try:
             sample_rate = int(self.sampleRateEdit.text())
@@ -730,7 +734,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.recordBtn.setEnabled(True)
         self.testSignalStartBtn.setEnabled(True)
         self.daqCombo.setEnabled(False)
-        self.chanEdit.setEnabled(False)
+        self.inputChanEdit.setEnabled(False)
+        self.copyChanEdit.setEnabled(False)
         self.outputChanEdit.setEnabled(False)
         self.sampleRateEdit.setEnabled(False)
         self.plotDurEdit.setEnabled(False)
@@ -885,6 +890,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
     def start_record(self):
         """Start recording with synchronized playback stimulus."""
         self.recordBtn.setEnabled(False)
+        self.testSignalStartBtn.setEnabled(False)
         
         # Ensure any previous output task is fully cleaned up
         if self.acq is not None:
@@ -892,9 +898,13 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             # Small delay to ensure hardware releases resources
             QtCore.QThread.msleep(50)
         
-        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Playback Data", "", "Binary files (*.bin)")
+        fish_id = self.fishIdEdit.text().strip().replace('.', '-').replace(' ', '_') or "recording"
+        offset_str = self.offsetCombo.currentText().replace('.', 'p').replace('-', 'm')
+        default_name = f"{fish_id}_{offset_str}Hz.bin"
+        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Playback Data", default_name, "Binary files (*.bin)")
         if not filepath:
             self.recordBtn.setEnabled(True)
+            self.testSignalStartBtn.setEnabled(True)
             return
         
         try:
@@ -906,6 +916,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Input Error", f"Invalid playback parameter: {e}")
             self.recordBtn.setEnabled(True)
+            self.testSignalStartBtn.setEnabled(True)
             return
         
         total_duration = pre_stim_duration + stim_duration + post_stim_duration
@@ -920,6 +931,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         else:
             QtWidgets.QMessageBox.warning(self, "Error", "No data available for frequency analysis.")
             self.recordBtn.setEnabled(True)
+            self.testSignalStartBtn.setEnabled(True)
             return
 
         self.log_data = {
@@ -932,6 +944,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "total_duration": total_duration,
             "offset_frequency": self.offsetCombo.currentText(),
             "amp_factor": self.ampFactorEdit.text(),
+            "input_channel_text": self.inputChanEdit.text().strip(),
+            "copy_channel_text": self.copyChanEdit.text().strip(),
         }
 
         # Generate synthetic playback signal
@@ -995,7 +1009,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Temperature": self.log_data["temperature"],
             "Conductivity": self.log_data["conductivity"],
             "Total_Recording_Duration": str(self.log_data["total_duration"]),
-            "Input_Channels": ', '.join(self.acq.input_channels),
+            "Input_Channels": self.log_data["input_channel_text"],
+            "Playback_Copy_Channel": self.log_data["copy_channel_text"] if self.log_data["copy_channel_text"] else "N/A",
             "Output_Channel": self.acq.output_channel if self.acq.output_channel else "N/A",
             "Recording_Start_Timestamp": timestamp_str,
             "Dominant_Frequency": getattr(self, 'dominant_freq', 'N/A'),
@@ -1028,7 +1043,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.testSignalStartBtn.setEnabled(False)
         self.testSignalStopBtn.setEnabled(False)
         self.daqCombo.setEnabled(True)
-        self.chanEdit.setEnabled(True)
+        self.inputChanEdit.setEnabled(True)
+        self.copyChanEdit.setEnabled(True)
         self.outputChanEdit.setEnabled(True)
         self.sampleRateEdit.setEnabled(True)
         self.plotDurEdit.setEnabled(True)

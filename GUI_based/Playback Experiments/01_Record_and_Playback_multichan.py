@@ -41,15 +41,34 @@ if not daqList:
     sys.exit(1)
 
 # ---------------- Signal Generation Functions ----------------
-def compute_dominant_frequency(data, sample_rate, min_freq, max_freq):
-    """Compute the dominant frequency of a quasi-sinusoidal signal within specified bounds."""
+def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=None, hint_window=20, notch_width=3):
     fft_result = np.fft.rfft(data)
     frequencies = np.fft.rfftfreq(len(data), d=1/sample_rate)
-    valid_indices = np.where((frequencies >= min_freq) & (frequencies <= max_freq))
-    filtered_frequencies = frequencies[valid_indices]
-    filtered_fft_result = np.abs(fft_result[valid_indices])
+    valid_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+
+    # Notch out 50 Hz mains harmonics, but exempt the region around hint_freq
+    harmonic = 50.0
+    while harmonic <= max_freq:
+        notch_bin = np.abs(frequencies - harmonic) < notch_width
+        if hint_freq is not None and hint_freq > 0:
+            # Don't notch bins that are within hint_window of the user-supplied hint
+            protected = np.abs(frequencies - hint_freq) <= hint_window
+            notch_bin &= ~protected
+        valid_mask &= ~notch_bin
+        harmonic += 50.0
+
+    filtered_frequencies = frequencies[valid_mask]
+    filtered_fft_result = np.abs(fft_result[valid_mask])
     if len(filtered_fft_result) == 0:
         return 0.0
+
+    # If a hint is provided, restrict search to ±hint_window Hz around it
+    if hint_freq is not None and hint_freq > 0:
+        hint_mask = np.abs(filtered_frequencies - hint_freq) <= hint_window
+        if np.any(hint_mask):
+            filtered_frequencies = filtered_frequencies[hint_mask]
+            filtered_fft_result = filtered_fft_result[hint_mask]
+
     dominant_freq = filtered_frequencies[np.argmax(filtered_fft_result)]
     return dominant_freq
 
@@ -590,7 +609,10 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         exp_layout.addRow("Temp. (C):", self.tempEdit)
         self.condEdit = QtWidgets.QLineEdit()
         exp_layout.addRow("Cond. (uS):", self.condEdit)
-        
+        self.fishFreqEdit = QtWidgets.QLineEdit()
+        self.fishFreqEdit.setPlaceholderText("e.g. 850 (optional)")
+        exp_layout.addRow("Expected Fish Freq (Hz):", self.fishFreqEdit)
+
         # Playback Settings
         self.offsetCombo = QtWidgets.QComboBox()
         self.offsetCombo.addItems(["-200", "-100", "-20", "-10", "-5", "-2.5", "0", "2.5", "5", "10", "20", "100", "200"])
@@ -768,8 +790,36 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
 
                 if self.domFreqCheck.isChecked() and Sxx.size > 0 and f.size > 0:
                     mean_spectrum = np.mean(Sxx, axis=1)
-                    dom_idx = np.argmax(mean_spectrum)
-                    dom_freq = f[dom_idx]
+
+                    # Mask out 50 Hz harmonics, exempting the hint region
+                    dom_mask = np.ones(len(f), dtype=bool)
+                    hint_text = self.fishFreqEdit.text().strip()
+                    hint_val = None
+                    if hint_text:
+                        try:
+                            hint_val = float(hint_text)
+                        except ValueError:
+                            pass
+                    harmonic = 50.0
+                    while harmonic <= self.max_freq:
+                        notch_bin = np.abs(f - harmonic) < 3.0
+                        if hint_val is not None:
+                            protected = np.abs(f - hint_val) <= 50.0
+                            notch_bin &= ~protected
+                        dom_mask &= ~notch_bin
+                        harmonic += 50.0
+
+                    # Apply frequency hint if provided
+                    if hint_val is not None:
+                        hint_mask = np.abs(f - hint_val) <= 50.0
+                        if np.any(hint_mask & dom_mask):
+                            dom_mask &= hint_mask
+
+                    if np.any(dom_mask):
+                        dom_freq = f[dom_mask][np.argmax(mean_spectrum[dom_mask])]
+                    else:
+                        dom_freq = f[np.argmax(mean_spectrum)]
+
                     self.domFreqLabel.setText(f"Dominant Frequency: {dom_freq:.1f} Hz")
                     self.specPlotWidget.setTitle(f"Spectrogram (Dominant: {dom_freq:.1f} Hz)")
                 else:
@@ -864,7 +914,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         # Compute dominant frequency from current plot buffer
         if self.acq and len(self.acq.plot_buffer[0]) > 0:
             data = np.array(self.acq.plot_buffer[0])
-            self.dominant_freq = compute_dominant_frequency(data, self.sample_rate, self.min_freq, self.max_freq)
+            hint_text = self.fishFreqEdit.text().strip()
+            hint_freq = float(hint_text) if hint_text else None
+            self.dominant_freq = compute_dominant_frequency(data, self.sample_rate, self.min_freq, self.max_freq, hint_freq=hint_freq)
         else:
             QtWidgets.QMessageBox.warning(self, "Error", "No data available for frequency analysis.")
             self.recordBtn.setEnabled(True)

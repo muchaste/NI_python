@@ -14,6 +14,8 @@ class AnalysisGUI:
 
         # GUI variables
         self.subtract_stimulus_flag = IntVar(value=1)
+        self.combine_channels_flag = IntVar(value=1)
+        self.n_recording_channels = 1
         self.threshold = DoubleVar(value=0.001)
         # self.stim_threshold = DoubleVar(value=0.001)
         self.nfft = IntVar(value=14)  # Default NFFT
@@ -27,33 +29,50 @@ class AnalysisGUI:
         self.log_data = None
         self.data = None
 
-        # Create plot area
-        self.plot_frame = Frame(self.root)
-        self.plot_frame.pack(side="top", fill="both", expand=True)
+        # Main layout: controls left, plot right
+        main_frame = Frame(self.root)
+        main_frame.pack(fill="both", expand=True)
 
-        # Create control area
-        self.control_frame = Frame(self.root)
-        self.control_frame.pack(side="bottom", fill="x")
+        self.control_frame = Frame(main_frame, width=230, bd=1, relief="sunken")
+        self.control_frame.pack(side="left", fill="y", padx=5, pady=5)
+        self.control_frame.pack_propagate(False)
 
-        # Add controls
-        Button(self.control_frame, text="Load File", command=self.load_file).pack(side="left", padx=5, pady=5)
-        Checkbutton(self.control_frame, text="Subtract Stimulus", variable=self.subtract_stimulus_flag).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Threshold:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.threshold, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Stim Threshold:").pack(side="left", padx=5, pady=5)
-        # Entry(self.control_frame, textvariable=self.stim_threshold, width=10).pack(side="left", padx=5, pady=5)
-        Checkbutton(self.control_frame, text="Bandpass Filter", variable=self.bandpass_filter_flag).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Bandpass width (Hz):").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.bandpass_width, width=10).pack(side="left", padx=5, pady=5)
-        # Label(self.control_frame, text="Bandpass high cutoff (Hz):").pack(side="left", padx=5, pady=5)
-        # Entry(self.control_frame, textvariable=self.hp_cutoff, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="NFFT exponent:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.nfft, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="noverlap exponent:").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.noverlap, width=10).pack(side="left", padx=5, pady=5)
-        Label(self.control_frame, text="Frequency Band (Hz):").pack(side="left", padx=5, pady=5)
-        Entry(self.control_frame, textvariable=self.freq_band, width=10).pack(side="left", padx=5, pady=5)
-        Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot).pack(side="left", padx=5, pady=5)
+        self.plot_frame = Frame(main_frame)
+        self.plot_frame.pack(side="left", fill="both", expand=True)
+
+        # Controls in vertical grid
+        r = 0
+        Button(self.control_frame, text="Load File", command=self.load_file).grid(
+            row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        r += 1
+        Checkbutton(self.control_frame, text="Subtract Stimulus", variable=self.subtract_stimulus_flag).grid(
+            row=r, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        r += 1
+        self.combine_checkbox = Checkbutton(self.control_frame, text="Combine Channels",
+                                            variable=self.combine_channels_flag, state="disabled")
+        self.combine_checkbox.grid(row=r, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        r += 1
+        Checkbutton(self.control_frame, text="Bandpass Filter", variable=self.bandpass_filter_flag).grid(
+            row=r, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="Threshold:").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.threshold, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="Bandpass width (Hz):").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.bandpass_width, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="NFFT exponent:").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.nfft, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="noverlap exponent:").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.noverlap, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Label(self.control_frame, text="Frequency Band (Hz):").grid(row=r, column=0, sticky="w", padx=5, pady=2)
+        Entry(self.control_frame, textvariable=self.freq_band, width=8).grid(row=r, column=1, sticky="ew", padx=5, pady=2)
+        r += 1
+        Button(self.control_frame, text="Refresh Plot", command=self.refresh_plot).grid(
+            row=r, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+        self.control_frame.columnconfigure(1, weight=1)
 
         # Initialize plot
         self.fig, self.axes = plt.subplots(4, 1, figsize=(15, 8))
@@ -65,6 +84,14 @@ class AnalysisGUI:
         filepath = filedialog.askopenfilename(title="Select Log File", filetypes=[("Text files", "*.txt")])
         if filepath:
             self.log_data, self.data = self.load_data(filepath)
+            has_copy = self.log_data.get("Playback_Copy_Channel", "N/A") != "N/A"
+            n_total = int(self.log_data["N_Input_Channels"])
+            self.n_recording_channels = n_total - (1 if has_copy else 0)
+            if self.n_recording_channels > 1:
+                self.combine_checkbox.config(state="normal")
+            else:
+                self.combine_channels_flag.set(0)
+                self.combine_checkbox.config(state="disabled")
             self.refresh_plot()
 
     def load_data(self, log_filepath):
@@ -321,15 +348,25 @@ class AnalysisGUI:
 
         total_samples = len(self.data)
         time_axis = np.arange(total_samples) / sample_rate
+        pre_stim_samples = pre_stim_duration * sample_rate
 
-        # Detrend raw data
-        channel_1 = detrend(self.data["ch 0"])
-        stimulus = detrend(self.data["ch 1"])
-        # channel_3 = detrend(self.data["ch 2"])  # Stimulus
+        # Determine channel layout from log
+        n_total = int(self.log_data["N_Input_Channels"])
+        has_copy = self.log_data.get("Playback_Copy_Channel", "N/A") != "N/A"
+        n_recording = n_total - (1 if has_copy else 0)
 
-        # Cumulated data
-        # correlation = np.corrcoef(channel_1[:(pre_stim_duration*sample_rate)], channel_2[:(pre_stim_duration*sample_rate)])[0, 1]
-        # cumulated_data = channel_1 + channel_2 if correlation > 0 else channel_1 - channel_2
+        # Stimulus is always the last channel
+        stimulus = detrend(self.data[f"ch {n_total - 1}"])
+
+        # Recording channel(s): combine if checkbox active and multiple channels present
+        if self.combine_channels_flag.get() and n_recording > 1:
+            channel_1 = detrend(self.data["ch 0"])
+            for ch_idx in range(1, n_recording):
+                next_ch = detrend(self.data[f"ch {ch_idx}"])
+                corr = np.corrcoef(channel_1[:pre_stim_samples], next_ch[:pre_stim_samples])[0, 1]
+                channel_1 = channel_1 + next_ch if corr > 0 else channel_1 - next_ch
+        else:
+            channel_1 = detrend(self.data["ch 0"])
 
         # Subtract stimulus if checkbox is checked
         amp_facts = np.arange(1,61)
@@ -435,7 +472,6 @@ class AnalysisGUI:
 
         # Plot statistics
         frequency_band = self.freq_band.get()
-        pre_stim_samples = pre_stim_duration * sample_rate
         stim_samples = stim_duration * sample_rate
         # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 

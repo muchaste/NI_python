@@ -515,6 +515,64 @@ class FileWriter(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
+# ---------------- Frequency Confirmation Dialog ----------------
+class FrequencyConfirmDialog(QtWidgets.QDialog):
+    def __init__(self, dominant_freq, offset_frequency, plot_buffer, sample_rate, min_freq, max_freq, hint_freq, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm Playback Frequencies")
+        self.setModal(True)
+        self.dominant_freq = dominant_freq
+        self.offset_frequency = offset_frequency
+        self.plot_buffer = plot_buffer
+        self.sample_rate = sample_rate
+        self.min_freq = min_freq
+        self.max_freq = max_freq
+        self.hint_freq = hint_freq
+        self.confirmed_freq = dominant_freq
+
+        layout = QtWidgets.QVBoxLayout()
+
+        self.info_label = QtWidgets.QLabel()
+        self.info_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.info_label.setStyleSheet("font-size: 14px; padding: 10px;")
+        self._update_label()
+        layout.addWidget(self.info_label)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        ok_btn = QtWidgets.QPushButton("OK")
+        ok_btn.setStyleSheet("color: green; font-weight: bold;")
+        ok_btn.clicked.connect(self.accept)
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.setStyleSheet("color: #003366; font-weight: bold;")
+        refresh_btn.clicked.connect(self._refresh)
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.setStyleSheet("color: red; font-weight: bold;")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+        self.resize(360, 140)
+
+    def _update_label(self):
+        playback_freq = self.confirmed_freq + self.offset_frequency
+        self.info_label.setText(
+            f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+            f"Playback frequency:    {playback_freq:.1f} Hz  "
+            f"(offset: {self.offset_frequency:+.1f} Hz)"
+        )
+
+    def _refresh(self):
+        data = np.array(list(self.plot_buffer[0]))
+        if data.size > 0:
+            self.confirmed_freq = compute_dominant_frequency(
+                data, self.sample_rate, self.min_freq, self.max_freq, hint_freq=self.hint_freq
+            )
+            self._update_label()
+
+
 # ---------------- PyQt5 GUI Module ----------------
 class DataAcquisitionGUI(QtWidgets.QWidget):
     def __init__(self):
@@ -559,7 +617,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         # Plot Settings
         self.plotGroup = QtWidgets.QGroupBox("Data Settings")
         plot_layout = QtWidgets.QFormLayout()
-        self.plotDurEdit = QtWidgets.QLineEdit("1")
+        self.plotDurEdit = QtWidgets.QLineEdit("2")
         plot_layout.addRow("Plot Duration (s):", self.plotDurEdit)
         self.refreshRateEdit = QtWidgets.QLineEdit("10")
         plot_layout.addRow("Refresh Rate (Hz):", self.refreshRateEdit)
@@ -933,6 +991,17 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             self.recordBtn.setEnabled(True)
             self.testSignalStartBtn.setEnabled(True)
             return
+
+        # Confirm detected and playback frequencies with the user before starting
+        dlg = FrequencyConfirmDialog(
+            self.dominant_freq, offset_frequency, self.acq.plot_buffer,
+            self.sample_rate, self.min_freq, self.max_freq, hint_freq
+        )
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            self.recordBtn.setEnabled(True)
+            self.testSignalStartBtn.setEnabled(True)
+            return
+        self.dominant_freq = dlg.confirmed_freq
 
         self.log_data = {
             "fish_id": self.fishIdEdit.text(),

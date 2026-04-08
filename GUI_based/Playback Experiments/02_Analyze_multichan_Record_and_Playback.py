@@ -369,6 +369,10 @@ class AnalysisGUI:
         fish_id = self.log_data["Fish_ID"]
         fish_freq = float(self.log_data["Dominant_Frequency"])
         frequency_offset = self.log_data["Frequency_Offset"]
+        playback_mode = self.log_data.get("Playback_Mode", "Static")
+        ramp_start_offset = float(self.log_data.get("Ramp_Start_Offset", 0))
+        ramp_end_offset   = float(self.log_data.get("Ramp_End_Offset", 0))
+        clamp_offset      = float(self.log_data.get("Clamp_Offset", 0))
         try:
             temperature = float(self.log_data["Temperature"])
         except KeyError:
@@ -445,8 +449,17 @@ class AnalysisGUI:
         if self.bandpass_filter_flag.get():
             low_freq = round(float(self.log_data['Dominant_Frequency'])) - self.bandpass_width.get()/2
             high_freq = round(float(self.log_data['Dominant_Frequency'])) + self.bandpass_width.get()/2
-            low_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) - self.bandpass_width.get()/2
-            high_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) + self.bandpass_width.get()/2
+            if playback_mode == "Ramp":
+                sweep_lo = fish_freq + min(ramp_start_offset, ramp_end_offset)
+                sweep_hi = fish_freq + max(ramp_start_offset, ramp_end_offset)
+                low_freq_stim  = max(min_freq, sweep_lo - 50)
+                high_freq_stim = min(max_freq, sweep_hi + 50)
+            elif playback_mode == "Freq. Clamp":
+                low_freq_stim  = fish_freq + clamp_offset - self.bandpass_width.get() / 2
+                high_freq_stim = fish_freq + clamp_offset + self.bandpass_width.get() / 2
+            else:
+                low_freq_stim  = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) - self.bandpass_width.get()/2
+                high_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) + self.bandpass_width.get()/2
             
             # Filter fish signal
             cumulated_cleaned_data_filtered, fish_bandpass_applied = self.bandpass_filter(cumulated_cleaned_data, sample_rate, low_freq, high_freq)
@@ -480,6 +493,10 @@ class AnalysisGUI:
         self.instant_freq = instant_freq
         self.instant_time = instant_time
 
+        # Pre-stimulus baseline EOD frequency (more precise than log FFT value)
+        pre_stim_mask = instant_time < pre_stim_duration
+        baseline_fish_freq = float(np.median(instant_freq[pre_stim_mask])) if np.any(pre_stim_mask) else fish_freq
+
         # Filter stimulus instantaneous frequency to stimulus period only
         if len(instant_time_stim) > 0:
             stim_mask = np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]
@@ -495,12 +512,58 @@ class AnalysisGUI:
             self.axes[2].plot(instant_time, instant_freq,'.')
         if len(instant_time_stim) > 0:
             self.axes[2].plot(instant_time_stim, instant_freq_stim,'.')
-        
+
         # Show warning if no data could be plotted
         if len(instant_time) == 0 and len(instant_time_stim) == 0:
             self.axes[2].text(0.5, 0.5, 'No zero crossings detected\nTry lowering the threshold or adjusting filter settings',
                             ha='center', va='center', transform=self.axes[2].transAxes,
                             fontsize=12, color='red')
+
+        # Mode-specific overlays and stats initialisation
+        ramp_crossing_time = np.nan
+        ramp_fish_at_crossing = np.nan
+        ramp_jar_at_crossing = np.nan
+        ramp_jar_rate = np.nan
+        clamp_max_jar = clamp_mean_jar = clamp_steady_jar = clamp_latency = np.nan
+
+        if playback_mode == "Ramp":
+            t_ramp = np.linspace(pre_stim_duration, pre_stim_duration + stim_duration, stim_duration * 10)
+            f_ramp = (fish_freq + ramp_start_offset) + (ramp_end_offset - ramp_start_offset) * np.linspace(0, 1, len(t_ramp))
+            self.axes[2].plot(t_ramp, f_ramp, 'r--', linewidth=1.5, label="Expected ramp", zorder=3)
+            if ramp_start_offset * ramp_end_offset < 0:
+                crossing_frac = abs(ramp_start_offset) / abs(ramp_end_offset - ramp_start_offset)
+                ramp_crossing_time = pre_stim_duration + crossing_frac * stim_duration
+                self.axes[2].axvline(ramp_crossing_time, color='r', linestyle=':', alpha=0.6, label="DF=0")
+                if len(instant_time) > 0:
+                    ramp_fish_at_crossing = float(np.interp(ramp_crossing_time, instant_time, instant_freq))
+                    ramp_jar_at_crossing = ramp_fish_at_crossing - baseline_fish_freq
+                    window_s = 10
+                    rate_mask = (instant_time >= ramp_crossing_time - window_s) & \
+                                (instant_time <= ramp_crossing_time + window_s)
+                    if np.sum(rate_mask) > 1:
+                        coeffs = np.polyfit(instant_time[rate_mask], instant_freq[rate_mask], 1)
+                        ramp_jar_rate = float(coeffs[0])
+            self.axes[2].legend(loc="upper right", fontsize=8)
+
+        elif playback_mode == "Freq. Clamp":
+            clamp_target = fish_freq + clamp_offset
+            self.axes[2].axhline(clamp_target, color='g', linestyle='--', linewidth=1.5,
+                                 label=f"Clamp target ({clamp_target:.1f} Hz)", zorder=3)
+            if len(instant_time) > 0:
+                stim_if_mask = (instant_time >= pre_stim_duration) & \
+                               (instant_time < pre_stim_duration + stim_duration)
+                stim_freqs = instant_freq[stim_if_mask]
+                stim_times = instant_time[stim_if_mask]
+                if len(stim_freqs) > 0:
+                    clamp_max_jar  = float(np.max(stim_freqs)  - baseline_fish_freq)
+                    clamp_mean_jar = float(np.mean(stim_freqs) - baseline_fish_freq)
+                    ss_mask = stim_times >= pre_stim_duration + stim_duration - 10
+                    ss_freqs = stim_freqs[ss_mask]
+                    clamp_steady_jar = float(np.mean(ss_freqs) - baseline_fish_freq) if len(ss_freqs) > 0 else np.nan
+                    above = stim_freqs > (baseline_fish_freq + 1.0)
+                    clamp_latency = float(stim_times[above][0] - pre_stim_duration) if np.any(above) else np.nan
+            self.axes[2].legend(loc="upper right", fontsize=8)
+
         self.axes[2].set_title("Instantaneous Frequency — click 'Detect FMs' to label events")
         self.axes[2].set_ylabel("Frequency (Hz)")
         self.axes[2].set_xlabel("Time (s)")
@@ -518,10 +581,10 @@ class AnalysisGUI:
             "Post-Stimulus": (pre_stim_samples + stim_samples, total_samples)
         }
 
-        stats = {}
+        stats = {"Dominant Freq (spectrogram)": {}, "Median Inst. Freq": {}}
         for period, (start, end) in periods.items():
             dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
-            
+
             # Calculate median instantaneous frequency if data exists
             if len(instant_time) > 0:
                 period_mask = (instant_time >= start / sample_rate) & (instant_time < end / sample_rate)
@@ -529,15 +592,26 @@ class AnalysisGUI:
                 freq_median = np.median(period_freqs) if len(period_freqs) > 0 else np.nan
             else:
                 freq_median = np.nan
-            
-            # temp = temperature
-            # cond = conductivity
-            # amp_cov_cum = np.abs(np.std(cumulated_cleaned_data[start:end]) / np.mean(cumulated_cleaned_data[start:end]))
-            # envelope_cum_period = detrend(envelope_cum[start:end])+1
-            # envelope_cov = np.std(envelope_cum_period) #/np.mean(envelope_cum))
-            stats[period] = (dom_freq, freq_median)#, amp_cov_ch1, amp_cov_ch2, envelope_cov
 
-        stats_df = pd.DataFrame(stats, index=["Dominant Freq (spectrogram)", "Median Inst. Freq"]) #"Amp. CoV (envelope)","Amp. CoV (Ch 1)", "Amp. CoV (Ch 2)",
+            stats["Dominant Freq (spectrogram)"][period] = round(dom_freq, 2)
+            stats["Median Inst. Freq"][period] = round(float(freq_median), 2) if not np.isnan(freq_median) else "N/A"
+
+        def _fmt(v):
+            return "N/A" if (isinstance(v, float) and np.isnan(v)) else round(float(v), 2)
+
+        if playback_mode == "Ramp" and not np.isnan(ramp_crossing_time):
+            blank = {p: "-" for p in periods}
+            stats["Crossing Time (s)"]    = {**blank, "Complete Stimulus": _fmt(ramp_crossing_time - pre_stim_duration)}
+            stats["JAR at Crossing (Hz)"] = {**blank, "Complete Stimulus": _fmt(ramp_jar_at_crossing)}
+            stats["JAR Rate (Hz/s)"]      = {**blank, "Complete Stimulus": _fmt(ramp_jar_rate)}
+        elif playback_mode == "Freq. Clamp":
+            blank = {p: "-" for p in periods}
+            stats["Max JAR (Hz)"]          = {**blank, "Complete Stimulus": _fmt(clamp_max_jar)}
+            stats["Mean JAR (Hz)"]         = {**blank, "Complete Stimulus": _fmt(clamp_mean_jar)}
+            stats["Steady-state JAR (Hz)"] = {**blank, "Complete Stimulus": _fmt(clamp_steady_jar)}
+            stats["JAR Latency (s)"]       = {**blank, "Complete Stimulus": _fmt(clamp_latency)}
+
+        stats_df = pd.DataFrame(stats).T
         stats_df = stats_df.round(2)
         self.axes[3].axis("off")
         table = self.axes[3].table(

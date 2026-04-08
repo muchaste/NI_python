@@ -101,6 +101,8 @@ class AnalysisGUI:
 
         # Initialize plot
         self.fig, self.axes = plt.subplots(4, 1, figsize=(15, 8))
+        self.axes[1].sharex(self.axes[0])
+        self.axes[2].sharex(self.axes[0])
         self.canvas = None
         self.toolbar = None
 

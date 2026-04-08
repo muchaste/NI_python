@@ -41,10 +41,14 @@ if not daqList:
     sys.exit(1)
 
 # ---------------- Signal Generation Functions ----------------
-def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=None, hint_window=20, notch_width=3):
+def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=None, hint_window=20, notch_width=3, notch_freq=None):
     fft_result = np.fft.rfft(data)
     frequencies = np.fft.rfftfreq(len(data), d=1/sample_rate)
     valid_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+
+    # Notch out a known contaminating frequency (e.g. clamp playback signal)
+    if notch_freq is not None and notch_freq > 0:
+        valid_mask &= np.abs(frequencies - notch_freq) >= notch_width
 
     # Notch out 50 Hz mains harmonics, but exempt the region around hint_freq
     harmonic = 50.0
@@ -321,9 +325,13 @@ class DataAcquisition:
         self.recording_start_timestamp = None
         try:
             self.ai_task.stop()
-            self.ai_task.close()
         except Exception as e:
             print("Error stopping DAQ task:", e)
+        finally:
+            try:
+                self.ai_task.close()
+            except Exception as e:
+                print("Error closing DAQ task:", e)
 
     def callback(self, task_handle, event_type, number_of_samples, callback_data):
         if not self.running:
@@ -560,6 +568,7 @@ class ClampPlaybackThread(threading.Thread):
         chunks_written = 0
         gradient = np.arange(chunk_size) / chunk_size
         n_pre_buffer = 4
+        prev_play_freq = 0.0
         self.ao_task.out_stream.output_buf_size = chunk_size * (n_pre_buffer + 2)
 
         while not self.stop_event.is_set():
@@ -576,12 +585,16 @@ class ClampPlaybackThread(threading.Thread):
             else:
                 buf_data = np.array(self.plot_buffer[0])
                 if buf_data.size > 0:
+                    expected_fish_freq = prev_play_freq - self.clamp_offset if prev_play_freq > 0 else None
                     fish_freq = compute_dominant_frequency(
-                        buf_data, self.sample_rate, self.min_freq, self.max_freq
+                        buf_data, self.sample_rate, self.min_freq, self.max_freq,
+                        hint_freq=expected_fish_freq,
+                        notch_freq=prev_play_freq if prev_play_freq > 0 else None
                     )
                 else:
                     fish_freq = 0.0
                 play_freq = fish_freq + self.clamp_offset
+                prev_play_freq = play_freq
                 t_local = np.arange(chunk_size) / self.sample_rate
                 stim_sample = current_sample - self.pre_stim_samples
                 if stim_sample == 0:
@@ -593,7 +606,10 @@ class ClampPlaybackThread(threading.Thread):
                 chunk = amp_arr * np.sin(2 * np.pi * play_freq * t_local + current_phase)
                 current_phase = (current_phase + 2 * np.pi * play_freq * chunk_size / self.sample_rate) % (2 * np.pi)
 
-            self.ao_task.write(chunk, timeout=5.0)
+            try:
+                self.ao_task.write(chunk, timeout=5.0)
+            except Exception:
+                break
             chunks_written += 1
 
             if chunks_written == n_pre_buffer:
@@ -1294,6 +1310,10 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
 
     def stop_acquisition(self):
         self.stop_recording_indicator()
+        if hasattr(self, 'clamp_thread') and self.clamp_thread is not None:
+            self.clamp_thread.stop()
+            self.clamp_thread.join(timeout=5)
+            self.clamp_thread = None
         if self.file_writer is not None:
             self.file_writer.stop()
             self.file_writer.join(timeout=5)

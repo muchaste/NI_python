@@ -391,6 +391,7 @@ class AnalysisGUI:
         n_total = int(self.log_data["N_Input_Channels"])
         has_copy = self.log_data.get("Playback_Copy_Channel", "N/A") != "N/A"
         n_recording = n_total - (1 if has_copy else 0)
+        print(f"Channels: {n_total} total, {n_recording} recording, copy={'ch' + str(n_total-1) if has_copy else 'none'}, stimulus=ch{n_total-1}")
 
         # Stimulus is always the last channel
         stimulus = detrend(self.data[f"ch {n_total - 1}"])
@@ -509,9 +510,9 @@ class AnalysisGUI:
         
         # Plot instantaneous frequency (only if data exists)
         if len(instant_time) > 0:
-            self.axes[2].plot(instant_time, instant_freq,'.')
+            self.axes[2].plot(instant_time, instant_freq, '.', color='steelblue', markersize=2, label='Fish EOD')
         if len(instant_time_stim) > 0:
-            self.axes[2].plot(instant_time_stim, instant_freq_stim,'.')
+            self.axes[2].plot(instant_time_stim, instant_freq_stim, '.', color='darkorange', markersize=2, label='Stim. copy')
 
         # Show warning if no data could be plotted
         if len(instant_time) == 0 and len(instant_time_stim) == 0:
@@ -563,6 +564,10 @@ class AnalysisGUI:
                     above = stim_freqs > (baseline_fish_freq + 1.0)
                     clamp_latency = float(stim_times[above][0] - pre_stim_duration) if np.any(above) else np.nan
             self.axes[2].legend(loc="upper right", fontsize=8)
+
+        else:
+            if len(instant_time) > 0 or len(instant_time_stim) > 0:
+                self.axes[2].legend(loc="upper right", fontsize=8)
 
         self.axes[2].set_title("Instantaneous Frequency — click 'Detect FMs' to label events")
         self.axes[2].set_ylabel("Frequency (Hz)")

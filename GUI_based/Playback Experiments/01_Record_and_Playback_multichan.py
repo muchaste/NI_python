@@ -73,33 +73,44 @@ def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=
     return dominant_freq
 
 def generate_synthetic_signal(
-    dominant_freq, 
-    offset, 
-    pre_stim_duration, 
-    stimulus_duration, 
-    post_stim_duration, 
-    sample_rate, 
-    amp_factor
+    dominant_freq,
+    offset,
+    pre_stim_duration,
+    stimulus_duration,
+    post_stim_duration,
+    sample_rate,
+    amp_factor,
+    mode='static',
+    start_offset=0,
+    end_offset=0
 ):
     """Generate a synthetic signal with specified durations and amplitude modulation factor."""
     pre_stim_samples = int(pre_stim_duration * sample_rate)
     stimulus_samples = int(stimulus_duration * sample_rate)
     post_stim_samples = int(post_stim_duration * sample_rate)
-    
+
     pre_stim_signal = [0] * pre_stim_samples
-    
+
     time_array = np.arange(stimulus_samples) / sample_rate
-    frequency_with_offset = dominant_freq + offset
     amp_factor_array = np.repeat(float(amp_factor), stimulus_samples)
-    gradient = np.arange(sample_rate)/sample_rate
-    amp_factor_array[0:sample_rate] = amp_factor_array[0:sample_rate]*gradient
-    amp_factor_array[len(amp_factor_array)-sample_rate:] = amp_factor_array[len(amp_factor_array)-sample_rate:]*gradient[::-1]
-    stimulus_signal = amp_factor_array * np.sin(2 * np.pi * frequency_with_offset * time_array)
-    
+    gradient = np.arange(sample_rate) / sample_rate
+    amp_factor_array[0:sample_rate] = amp_factor_array[0:sample_rate] * gradient
+    amp_factor_array[len(amp_factor_array) - sample_rate:] = amp_factor_array[len(amp_factor_array) - sample_rate:] * gradient[::-1]
+
+    if mode == 'ramp':
+        f0 = dominant_freq + start_offset
+        f1 = dominant_freq + end_offset
+        stimulus_signal = amp_factor_array * signal.chirp(
+            time_array, f0=f0, f1=f1, t1=stimulus_duration, method='linear', phi=-90
+        )
+    else:
+        frequency_with_offset = dominant_freq + offset
+        stimulus_signal = amp_factor_array * np.sin(2 * np.pi * frequency_with_offset * time_array)
+
     post_stim_signal = [0] * post_stim_samples
-    
+
     synthetic_signal = np.concatenate((pre_stim_signal, stimulus_signal, post_stim_signal))
-    
+
     return synthetic_signal
 
 def generate_sine_wave(freq, sample_rate, amp_factor):
@@ -517,7 +528,8 @@ class FileWriter(threading.Thread):
 
 # ---------------- Frequency Confirmation Dialog ----------------
 class FrequencyConfirmDialog(QtWidgets.QDialog):
-    def __init__(self, dominant_freq, offset_frequency, plot_buffer, sample_rate, min_freq, max_freq, hint_freq, parent=None):
+    def __init__(self, dominant_freq, offset_frequency, plot_buffer, sample_rate, min_freq, max_freq, hint_freq,
+                 mode='Static', start_offset=0, end_offset=0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Confirm Playback Frequencies")
         self.setModal(True)
@@ -528,6 +540,9 @@ class FrequencyConfirmDialog(QtWidgets.QDialog):
         self.min_freq = min_freq
         self.max_freq = max_freq
         self.hint_freq = hint_freq
+        self.mode = mode
+        self.start_offset = start_offset
+        self.end_offset = end_offset
         self.confirmed_freq = dominant_freq
 
         layout = QtWidgets.QVBoxLayout()
@@ -554,15 +569,24 @@ class FrequencyConfirmDialog(QtWidgets.QDialog):
         layout.addLayout(btn_layout)
 
         self.setLayout(layout)
-        self.resize(360, 140)
+        self.resize(420, 170)
 
     def _update_label(self):
-        playback_freq = self.confirmed_freq + self.offset_frequency
-        self.info_label.setText(
-            f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
-            f"Playback frequency:    {playback_freq:.1f} Hz  "
-            f"(offset: {self.offset_frequency:+.1f} Hz)"
-        )
+        if self.mode == 'Ramp':
+            f0 = self.confirmed_freq + self.start_offset
+            f1 = self.confirmed_freq + self.end_offset
+            self.info_label.setText(
+                f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+                f"Playback ramps:        {f0:.1f} Hz  \u2192  {f1:.1f} Hz\n"
+                f"(start offset: {self.start_offset:+.1f} Hz,  end offset: {self.end_offset:+.1f} Hz)"
+            )
+        else:
+            playback_freq = self.confirmed_freq + self.offset_frequency
+            self.info_label.setText(
+                f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+                f"Playback frequency:    {playback_freq:.1f} Hz  "
+                f"(offset: {self.offset_frequency:+.1f} Hz)"
+            )
 
     def _refresh(self):
         data = np.array(list(self.plot_buffer[0]))
@@ -674,10 +698,23 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         exp_layout.addRow("Expected Fish Freq (Hz):", self.fishFreqEdit)
 
         # Playback Settings
+        self.playbackModeCombo = QtWidgets.QComboBox()
+        self.playbackModeCombo.addItems(["Static", "Ramp"])
+        exp_layout.addRow("Playback Mode:", self.playbackModeCombo)
         self.offsetCombo = QtWidgets.QComboBox()
         self.offsetCombo.addItems(["-200", "-100", "-20", "-10", "-5", "-2.5", "0", "2.5", "5", "10", "20", "100", "200"])
         self.offsetCombo.setCurrentText("0")
         exp_layout.addRow("Frequency Offset (Hz):", self.offsetCombo)
+        self.rampStartLabel = QtWidgets.QLabel("Ramp Start Offset (Hz):")
+        self.rampStartEdit = QtWidgets.QLineEdit("-200")
+        exp_layout.addRow(self.rampStartLabel, self.rampStartEdit)
+        self.rampEndLabel = QtWidgets.QLabel("Ramp End Offset (Hz):")
+        self.rampEndEdit = QtWidgets.QLineEdit("200")
+        exp_layout.addRow(self.rampEndLabel, self.rampEndEdit)
+        self.rampStartLabel.setVisible(False)
+        self.rampStartEdit.setVisible(False)
+        self.rampEndLabel.setVisible(False)
+        self.rampEndEdit.setVisible(False)
         self.preStimEdit = QtWidgets.QLineEdit("60")
         exp_layout.addRow("Pre-Stim Duration (s):", self.preStimEdit)
         self.stimEdit = QtWidgets.QLineEdit("60")
@@ -752,6 +789,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.resetBtn.clicked.connect(self.reset_device)
         self.closeBtn.clicked.connect(self.safe_close)
         self.audioOutputCheck.stateChanged.connect(self.toggle_audio_output)
+        self.playbackModeCombo.currentTextChanged.connect(self.on_playback_mode_changed)
         
         # Initial button states
         self.recordBtn.setEnabled(False)
@@ -945,6 +983,17 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "font-size: 16px; font-weight: bold; padding: 5px; border-radius: 3px;"
         )
 
+    def on_playback_mode_changed(self, mode):
+        is_ramp = mode == "Ramp"
+        offset_label = self.expGroup.layout().labelForField(self.offsetCombo)
+        if offset_label:
+            offset_label.setVisible(not is_ramp)
+        self.offsetCombo.setVisible(not is_ramp)
+        self.rampStartLabel.setVisible(is_ramp)
+        self.rampStartEdit.setVisible(is_ramp)
+        self.rampEndLabel.setVisible(is_ramp)
+        self.rampEndEdit.setVisible(is_ramp)
+
     def start_record(self):
         """Start recording with synchronized playback stimulus."""
         self.recordBtn.setEnabled(False)
@@ -957,8 +1006,12 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             QtCore.QThread.msleep(50)
         
         fish_id = self.fishIdEdit.text().strip().replace('.', '-').replace(' ', '_') or "recording"
-        offset_str = self.offsetCombo.currentText().replace('.', 'p').replace('-', 'm')
-        default_name = f"{fish_id}_{offset_str}Hz.bin"
+        playback_mode = self.playbackModeCombo.currentText()
+        if playback_mode == "Ramp":
+            default_name = f"{fish_id}_ramp.bin"
+        else:
+            offset_str = self.offsetCombo.currentText().replace('.', 'p').replace('-', 'm')
+            default_name = f"{fish_id}_{offset_str}Hz.bin"
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Playback Data", default_name, "Binary files (*.bin)")
         if not filepath:
             self.recordBtn.setEnabled(True)
@@ -969,8 +1022,15 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             pre_stim_duration = int(self.preStimEdit.text())
             stim_duration = int(self.stimEdit.text())
             post_stim_duration = int(self.postStimEdit.text())
-            offset_frequency = float(self.offsetCombo.currentText())
             amp_factor = float(self.ampFactorEdit.text())
+            if playback_mode == "Ramp":
+                start_offset = float(self.rampStartEdit.text())
+                end_offset = float(self.rampEndEdit.text())
+                offset_frequency = 0.0
+            else:
+                offset_frequency = float(self.offsetCombo.currentText())
+                start_offset = 0.0
+                end_offset = 0.0
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Input Error", f"Invalid playback parameter: {e}")
             self.recordBtn.setEnabled(True)
@@ -995,7 +1055,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         # Confirm detected and playback frequencies with the user before starting
         dlg = FrequencyConfirmDialog(
             self.dominant_freq, offset_frequency, self.acq.plot_buffer,
-            self.sample_rate, self.min_freq, self.max_freq, hint_freq
+            self.sample_rate, self.min_freq, self.max_freq, hint_freq,
+            mode=playback_mode, start_offset=start_offset, end_offset=end_offset
         )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             self.recordBtn.setEnabled(True)
@@ -1011,7 +1072,10 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "stim": stim_duration,
             "post_stim": post_stim_duration,
             "total_duration": total_duration,
+            "playback_mode": playback_mode,
             "offset_frequency": self.offsetCombo.currentText(),
+            "ramp_start_offset": start_offset,
+            "ramp_end_offset": end_offset,
             "amp_factor": self.ampFactorEdit.text(),
             "input_channel_text": self.inputChanEdit.text().strip(),
             "copy_channel_text": self.copyChanEdit.text().strip(),
@@ -1019,8 +1083,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
 
         # Generate synthetic playback signal
         playback_signal = generate_synthetic_signal(
-            self.dominant_freq, offset_frequency, pre_stim_duration, 
-            stim_duration, post_stim_duration, self.sample_rate, amp_factor
+            self.dominant_freq, offset_frequency, pre_stim_duration,
+            stim_duration, post_stim_duration, self.sample_rate, amp_factor,
+            mode=playback_mode.lower(), start_offset=start_offset, end_offset=end_offset
         )
         
         # Setup recording
@@ -1083,6 +1148,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Output_Channel": self.acq.output_channel if self.acq.output_channel else "N/A",
             "Recording_Start_Timestamp": timestamp_str,
             "Dominant_Frequency": getattr(self, 'dominant_freq', 'N/A'),
+            "Playback_Mode": self.log_data["playback_mode"],
             "Frequency_Offset": self.log_data["offset_frequency"],
             "Min_Frequency": self.min_freq,
             "Max_Frequency": self.max_freq,
@@ -1091,6 +1157,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Post_Stimulus_Duration": str(self.log_data["post_stim"]),
             "Amplitude_Factor": self.log_data["amp_factor"],
         }
+        if self.log_data["playback_mode"] == "Ramp":
+            log_out["Ramp_Start_Offset"] = self.log_data["ramp_start_offset"]
+            log_out["Ramp_End_Offset"] = self.log_data["ramp_end_offset"]
         with open(log_filepath, 'w') as f:
             for key, value in log_out.items():
                 f.write(f"{key}: {value}\n")

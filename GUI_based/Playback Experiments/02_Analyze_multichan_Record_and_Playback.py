@@ -422,7 +422,13 @@ class AnalysisGUI:
         self.axes[0].plot(time_axis, channel_1 + 2 * max_y, label="Raw Data")
         self.axes[0].plot(time_axis, cumulated_cleaned_data, label="Cleaned Data")
         # self.axes[0].plot(time_axis, envelope_cum, label="Envelope")
-        self.axes[0].set_title(f"Raw Data - Fish: {fish_id}, Freq. Offset: {frequency_offset} Hz, Temp.: {temperature} °C, Cond.: {conductivity} uS")
+        if playback_mode == "Ramp":
+            mode_str = f"Ramp: {ramp_start_offset:+.1f} → {ramp_end_offset:+.1f} Hz"
+        elif playback_mode == "Freq. Clamp":
+            mode_str = f"Freq. Clamp: {clamp_offset:+.1f} Hz"
+        else:
+            mode_str = f"Offset: {frequency_offset} Hz"
+        self.axes[0].set_title(f"Raw Data — Fish: {fish_id}, {mode_str}, Temp.: {temperature} °C, Cond.: {conductivity} µS")
         self.axes[0].set_ylabel("Amplitude")
         self.axes[0].legend(loc="lower left")
 

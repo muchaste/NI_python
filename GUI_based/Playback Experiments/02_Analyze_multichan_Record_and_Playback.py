@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
 import os
-from scipy.signal import detrend, hilbert, butter, filtfilt
+from scipy.signal import detrend, hilbert, butter, filtfilt, find_peaks
 from scipy.ndimage import label as ndimage_label
 
 class AnalysisGUI:
@@ -23,9 +23,9 @@ class AnalysisGUI:
         self.noverlap = IntVar(value=9)  # Default noverlap
         # self.env_lp = IntVar(value=5)   # Default lowpass cutoff frequency
         self.bandpass_filter_flag = IntVar(value=1)
-        self.bandpass_width = IntVar(value=300)
-        self.lp_cutoff = IntVar(value=400)
-        self.hp_cutoff = IntVar(value=1200)
+        self.bandpass_width = IntVar(value=800)
+        # self.lp_cutoff = IntVar(value=400)
+        # self.hp_cutoff = IntVar(value=1200)
         self.freq_band = IntVar(value=50)
         self.log_data = None
         self.data = None
@@ -316,18 +316,37 @@ class AnalysisGUI:
 
         return y
 
-    def compute_dominant_frequency(self, data, sample_rate, min_freq, max_freq):
+    def compute_dominant_frequency(self, data, sample_rate, min_freq, max_freq, stim_freq=None):
         """Compute the dominant frequency of a quasi-sinusoidal signal within specified bounds."""
-        # Compute FFT and frequency bins
         fft_result = np.fft.rfft(data)
         frequencies = np.fft.rfftfreq(len(data), d=1/sample_rate)
-        # Apply frequency bounds
-        valid_indices = np.where((frequencies >= min_freq) & (frequencies <= max_freq))
-        filtered_frequencies = frequencies[valid_indices]
-        filtered_fft_result = np.abs(fft_result[valid_indices])
-        # Find the frequency with the maximum FFT amplitude within the bounded range
-        dominant_freq = filtered_frequencies[np.argmax(filtered_fft_result)]
-        return dominant_freq
+
+        valid_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+        f = frequencies[valid_mask]
+        a = np.abs(fft_result[valid_mask])
+
+        if len(f) == 0:
+            return np.nan
+
+        # Build exclusion mask around known static stimulus frequency
+        # 2 Hz margin is generous given ~0.1 Hz FFT resolution at 40kHz/10s
+        if stim_freq is not None:
+            non_stim = np.abs(f - stim_freq) > 2.0
+        else:
+            non_stim = np.ones(len(f), dtype=bool)
+
+        # Find actual local spectral peaks (1% prominence filters noise floor)
+        peak_idxs, _ = find_peaks(a, prominence=np.max(a) * 0.01)
+        non_stim_peaks = [i for i in peak_idxs if non_stim[i]]
+
+        if non_stim_peaks:
+            return f[max(non_stim_peaks, key=lambda i: a[i])]
+
+        # Fallback: no distinct peak outside stim band — return max amplitude bin
+        if np.any(non_stim):
+            return f[non_stim][np.argmax(a[non_stim])]
+
+        return f[np.argmax(a)]  # last resort: ignore exclusion
 
     def calculate_envelope(self, data, sample_rate, lowpass_cutoff=5):
         # Hilbert Transform to compute the envelope
@@ -369,6 +388,7 @@ class AnalysisGUI:
         fish_id = self.log_data["Fish_ID"]
         fish_freq = float(self.log_data["Dominant_Frequency"])
         frequency_offset = self.log_data["Frequency_Offset"]
+        stimulus_freq = fish_freq + float(frequency_offset)
         playback_mode = self.log_data.get("Playback_Mode", "Static")
         ramp_start_offset = float(self.log_data.get("Ramp_Start_Offset", 0))
         ramp_end_offset   = float(self.log_data.get("Ramp_End_Offset", 0))
@@ -583,7 +603,6 @@ class AnalysisGUI:
         # Plot statistics
         frequency_band = self.freq_band.get()
         stim_samples = stim_duration * sample_rate
-        # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
             "Pre-Stimulus": (0, pre_stim_samples),
@@ -593,9 +612,24 @@ class AnalysisGUI:
         }
 
         stats = {"Dominant Freq (spectrogram)": {}, "Median Inst. Freq": {}}
-        for period, (start, end) in periods.items():
-            dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
+        # for period, (start, end) in periods.items():
+        #     dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
 
+        for period, (start, end) in periods.items():
+            if playback_mode == "Ramp":
+                # Ramp smears stimulus power across a frequency band — no exclusion needed
+                dom_freq = self.compute_dominant_frequency(
+                    cumulated_cleaned_data[start:end], sample_rate,
+                    max(1, fish_freq - frequency_band), fish_freq + frequency_band
+                )
+            else:
+                # Static or Freq. Clamp: stimulus is a fixed sine — exclude it
+                dom_freq = self.compute_dominant_frequency(
+                    cumulated_cleaned_data[start:end], sample_rate,
+                    max(1, fish_freq - frequency_band), fish_freq + frequency_band,
+                    stim_freq=stimulus_freq
+                )
+                
             # Calculate median instantaneous frequency if data exists
             if len(instant_time) > 0:
                 period_mask = (instant_time >= start / sample_rate) & (instant_time < end / sample_rate)
@@ -721,7 +755,7 @@ class AnalysisGUI:
                 fm_type = "Type 3"
             elif peak_hz >= 100 and duration_ms <= 150:
                 fm_type = "Type 1"
-            elif peak_hz <= 50 and duration_ms <= 50 and abs(rise_fraction - 0.5) < 0.25:
+            elif peak_hz <= 100 and duration_ms <= 100 and abs(rise_fraction - 0.5) < 0.25:
                 fm_type = "Type 2"
             elif peak_hz <= 20 and duration_ms <= 50:
                 fm_type = "Rise"

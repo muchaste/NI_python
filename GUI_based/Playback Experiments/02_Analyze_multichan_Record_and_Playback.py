@@ -2,9 +2,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
+from tkinter import Tk, Toplevel, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
 import os
-from scipy.signal import detrend, hilbert, butter, filtfilt, find_peaks
+from scipy.signal import detrend, hilbert, butter, filtfilt, find_peaks, welch
 from scipy.ndimage import label as ndimage_label
 
 class AnalysisGUI:
@@ -105,6 +105,12 @@ class AnalysisGUI:
         self.axes[2].sharex(self.axes[0])
         self.canvas = None
         self.toolbar = None
+        # State for interactive time-window FFT selection
+        self._press_x = None
+        self._drag_span = None
+        self.cumulated_cleaned_data = None
+        self.time_axis = None
+        self._sample_rate = None
 
     def load_file(self):
         """Load the log file and data."""
@@ -373,6 +379,8 @@ class AnalysisGUI:
         self.fm_events = None
         self.instant_freq = np.array([])
         self.instant_time = np.array([])
+        self._drag_span = None
+        self._press_x = None
         if hasattr(self, 'export_fm_button'):
             self.export_fm_button.config(state="disabled")
 
@@ -629,7 +637,7 @@ class AnalysisGUI:
                     max(1, fish_freq - frequency_band), fish_freq + frequency_band,
                     stim_freq=stimulus_freq
                 )
-                
+
             # Calculate median instantaneous frequency if data exists
             if len(instant_time) > 0:
                 period_mask = (instant_time >= start / sample_rate) & (instant_time < end / sample_rate)
@@ -689,6 +697,92 @@ class AnalysisGUI:
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
         self.toolbar.update()
         self.toolbar.pack(side="bottom", fill="x")
+
+        # Store data for interactive PSD selection and connect mouse events
+        self.cumulated_cleaned_data = cumulated_cleaned_data
+        self.time_axis = time_axis
+        self._sample_rate = sample_rate
+        self.canvas.mpl_connect('button_press_event', self._on_press)
+        self.canvas.mpl_connect('motion_notify_event', self._on_drag)
+        self.canvas.mpl_connect('button_release_event', self._on_release)
+
+    def _on_press(self, event):
+        if self.toolbar is not None and self.toolbar.mode != '':
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]):
+            return
+        self._press_x = event.xdata
+        if self._drag_span is not None:
+            try:
+                self._drag_span.remove()
+            except Exception:
+                pass
+            self._drag_span = None
+            self.canvas.draw_idle()
+
+    def _on_drag(self, event):
+        if self._press_x is None:
+            return
+        if self.toolbar is not None and self.toolbar.mode != '':
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]) or event.xdata is None:
+            return
+        if self._drag_span is not None:
+            try:
+                self._drag_span.remove()
+            except Exception:
+                pass
+        x0, x1 = sorted([self._press_x, event.xdata])
+        self._drag_span = self.axes[1].axvspan(x0, x1, alpha=0.3, color='yellow', zorder=10)
+        self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        if self._press_x is None:
+            return
+        if self.toolbar is not None and self.toolbar.mode != '':
+            self._press_x = None
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]) or event.xdata is None:
+            self._press_x = None
+            return
+        t1, t2 = sorted([self._press_x, event.xdata])
+        self._press_x = None
+        if t2 - t1 < 0.1:  # ignore accidental clicks
+            return
+        self._show_psd_popup(t1, t2)
+
+    def _show_psd_popup(self, t1, t2):
+        if self.cumulated_cleaned_data is None or self.time_axis is None:
+            return
+        mask = (self.time_axis >= t1) & (self.time_axis <= t2)
+        segment = self.cumulated_cleaned_data[mask]
+        if len(segment) < 256:
+            messagebox.showwarning("Selection Too Short", "Selected window is too short for PSD analysis.")
+            return
+        fs = self._sample_rate
+        min_freq = float(self.log_data["Min_Frequency"])
+        max_freq = float(self.log_data["Max_Frequency"])
+        # nperseg targets ~0.5 Hz resolution; capped at segment length
+        nperseg = min(len(segment), 2 * fs)
+        freqs, psd = welch(segment, fs=fs, nperseg=nperseg, window='hann')
+        freq_mask = (freqs >= min_freq) & (freqs <= max_freq)
+
+        popup = Toplevel(self.root)
+        popup.title(f"PSD  —  {t1:.2f} s to {t2:.2f} s  ({t2 - t1:.2f} s)")
+        fig_psd, ax_psd = plt.subplots(figsize=(7, 4))
+        ax_psd.semilogy(freqs[freq_mask], psd[freq_mask], color='steelblue', linewidth=0.8)
+        ax_psd.set_xlabel("Frequency (Hz)")
+        ax_psd.set_ylabel("PSD (V²/Hz)")
+        ax_psd.set_title(f"Welch PSD: {t1:.2f}–{t2:.2f} s  (Δf ≈ {fs / nperseg:.2f} Hz)")
+        ax_psd.grid(True, alpha=0.3)
+        fig_psd.tight_layout()
+        canvas_psd = FigureCanvasTkAgg(fig_psd, master=popup)
+        canvas_psd.draw()
+        canvas_psd.get_tk_widget().pack(fill="both", expand=True)
+        toolbar_psd = NavigationToolbar2Tk(canvas_psd, popup)
+        toolbar_psd.update()
+        toolbar_psd.pack(side="bottom", fill="x")
+        popup.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig_psd), popup.destroy()))
 
     def detect_fms(self):
         if len(self.instant_freq) == 0 or len(self.instant_time) == 0:

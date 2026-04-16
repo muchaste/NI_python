@@ -770,7 +770,24 @@ class AnalysisGUI:
         popup = Toplevel(self.root)
         popup.title(f"PSD  —  {t1:.2f} s to {t2:.2f} s  ({t2 - t1:.2f} s)")
         fig_psd, ax_psd = plt.subplots(figsize=(7, 4))
-        ax_psd.semilogy(freqs[freq_mask], psd[freq_mask], color='steelblue', linewidth=0.8)
+        psd_plot = psd[freq_mask]
+        freqs_plot = freqs[freq_mask]
+        ax_psd.semilogy(freqs_plot, psd_plot, color='steelblue', linewidth=0.8)
+
+        # Mark the 3 most prominent peaks
+        peak_idxs, props = find_peaks(psd_plot, prominence=np.max(psd_plot) * 0.01)
+        if len(peak_idxs) > 0:
+            # Sort by prominence descending, take top 3
+            top_n = min(3, len(peak_idxs))
+            top_idxs = peak_idxs[np.argsort(props['prominences'])[::-1][:top_n]]
+            for idx in top_idxs:
+                fx = freqs_plot[idx]
+                py = psd_plot[idx]
+                ax_psd.plot(fx, py, 'o', color='red', markersize=8,
+                            markerfacecolor='none', markeredgewidth=1.5)
+                ax_psd.text(fx, py * 1.5, f"{fx:.2f} Hz",
+                            color='red', fontsize=8, ha='center', va='bottom')
+
         ax_psd.set_xlabel("Frequency (Hz)")
         ax_psd.set_ylabel("PSD (V²/Hz)")
         ax_psd.set_title(f"Welch PSD: {t1:.2f}–{t2:.2f} s  (Δf ≈ {fs / nperseg:.2f} Hz)")

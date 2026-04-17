@@ -1,0 +1,15 @@
+name: ni_python
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - scipy
+  - pyqt          # provides PyQt5
+  - pyqtgraph
+  - pyarrow       # for reading legacy .feather / .parquet data files
+  - pip
+  - pip:
+    - nidaqmx     # NI-DAQmx Python API (requires NI-DAQmx driver on recording PC)

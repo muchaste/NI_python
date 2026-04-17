@@ -41,10 +41,14 @@ if not daqList:
     sys.exit(1)
 
 # ---------------- Signal Generation Functions ----------------
-def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=None, hint_window=20, notch_width=3):
+def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=None, hint_window=20, notch_width=3, notch_freq=None):
     fft_result = np.fft.rfft(data)
     frequencies = np.fft.rfftfreq(len(data), d=1/sample_rate)
     valid_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+
+    # Notch out a known contaminating frequency (e.g. clamp playback signal)
+    if notch_freq is not None and notch_freq > 0:
+        valid_mask &= np.abs(frequencies - notch_freq) >= notch_width
 
     # Notch out 50 Hz mains harmonics, but exempt the region around hint_freq
     harmonic = 50.0
@@ -73,33 +77,44 @@ def compute_dominant_frequency(data, sample_rate, min_freq, max_freq, hint_freq=
     return dominant_freq
 
 def generate_synthetic_signal(
-    dominant_freq, 
-    offset, 
-    pre_stim_duration, 
-    stimulus_duration, 
-    post_stim_duration, 
-    sample_rate, 
-    amp_factor
+    dominant_freq,
+    offset,
+    pre_stim_duration,
+    stimulus_duration,
+    post_stim_duration,
+    sample_rate,
+    amp_factor,
+    mode='static',
+    start_offset=0,
+    end_offset=0
 ):
     """Generate a synthetic signal with specified durations and amplitude modulation factor."""
     pre_stim_samples = int(pre_stim_duration * sample_rate)
     stimulus_samples = int(stimulus_duration * sample_rate)
     post_stim_samples = int(post_stim_duration * sample_rate)
-    
+
     pre_stim_signal = [0] * pre_stim_samples
-    
+
     time_array = np.arange(stimulus_samples) / sample_rate
-    frequency_with_offset = dominant_freq + offset
     amp_factor_array = np.repeat(float(amp_factor), stimulus_samples)
-    gradient = np.arange(sample_rate)/sample_rate
-    amp_factor_array[0:sample_rate] = amp_factor_array[0:sample_rate]*gradient
-    amp_factor_array[len(amp_factor_array)-sample_rate:] = amp_factor_array[len(amp_factor_array)-sample_rate:]*gradient[::-1]
-    stimulus_signal = amp_factor_array * np.sin(2 * np.pi * frequency_with_offset * time_array)
-    
+    gradient = np.arange(sample_rate) / sample_rate
+    amp_factor_array[0:sample_rate] = amp_factor_array[0:sample_rate] * gradient
+    amp_factor_array[len(amp_factor_array) - sample_rate:] = amp_factor_array[len(amp_factor_array) - sample_rate:] * gradient[::-1]
+
+    if mode == 'ramp':
+        f0 = dominant_freq + start_offset
+        f1 = dominant_freq + end_offset
+        stimulus_signal = amp_factor_array * signal.chirp(
+            time_array, f0=f0, f1=f1, t1=stimulus_duration, method='linear', phi=-90
+        )
+    else:
+        frequency_with_offset = dominant_freq + offset
+        stimulus_signal = amp_factor_array * np.sin(2 * np.pi * frequency_with_offset * time_array)
+
     post_stim_signal = [0] * post_stim_samples
-    
+
     synthetic_signal = np.concatenate((pre_stim_signal, stimulus_signal, post_stim_signal))
-    
+
     return synthetic_signal
 
 def generate_sine_wave(freq, sample_rate, amp_factor):
@@ -310,9 +325,13 @@ class DataAcquisition:
         self.recording_start_timestamp = None
         try:
             self.ai_task.stop()
-            self.ai_task.close()
         except Exception as e:
             print("Error stopping DAQ task:", e)
+        finally:
+            try:
+                self.ai_task.close()
+            except Exception as e:
+                print("Error closing DAQ task:", e)
 
     def callback(self, task_handle, event_type, number_of_samples, callback_data):
         if not self.running:
@@ -366,7 +385,7 @@ class DataAcquisition:
                     self.recording_complete_callback()
         return 0
     
-    def start_playback(self, playback_signal, total_duration):
+    def start_playback(self, playback_signal, total_duration, mode='static'):
         """Start synchronized playback with recording."""
         if self.output_channel is None or self.daq_device is None:
             raise ValueError("Output channel and DAQ device must be specified for playback")
@@ -386,16 +405,26 @@ class DataAcquisition:
             max_val=self.max_voltage, 
             units=constants.VoltageUnits.VOLTS
         )
-        self.ao_task.timing.cfg_samp_clk_timing(
-            self.sample_rate, 
-            source=f"/{self.daq_device}/ai/SampleClock",
-            sample_mode=constants.AcquisitionType.CONTINUOUS, 
-            samps_per_chan=len(playback_signal)
-        )
         
-        # Write signal and start (waits for ai sample clock)
-        self.ao_task.write(playback_signal, auto_start=False)
-        self.ao_task.start()
+        if mode == 'clamp':
+            self.ao_task.timing.cfg_samp_clk_timing(
+                self.sample_rate,
+                source=f"/{self.daq_device}/ai/SampleClock",
+                sample_mode=constants.AcquisitionType.CONTINUOUS,
+                samps_per_chan=self.sample_rate * 4
+            )
+            self.ao_task.out_stream.regen_mode = nidaqmx.constants.RegenerationMode.ALLOW_REGENERATION
+            # ClampPlaybackThread handles pre-buffering and task start
+        else:
+            self.ao_task.timing.cfg_samp_clk_timing(
+                self.sample_rate,
+                source=f"/{self.daq_device}/ai/SampleClock",
+                sample_mode=constants.AcquisitionType.CONTINUOUS,
+                samps_per_chan=len(playback_signal)
+            )
+            # Write signal and start (waits for ai sample clock)
+            self.ao_task.write(playback_signal, auto_start=False)
+            self.ao_task.start()
     
     def stop_playback(self):
         """Stop playback and clean up output task."""
@@ -515,9 +544,88 @@ class FileWriter(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
+
+class ClampPlaybackThread(threading.Thread):
+    def __init__(self, ao_task, plot_buffer, clamp_offset, amp_factor, sample_rate,
+                 min_freq, max_freq, pre_stim_samples, stim_samples, total_samples):
+        super().__init__(daemon=True)
+        self.ao_task = ao_task
+        self.plot_buffer = plot_buffer
+        self.clamp_offset = clamp_offset
+        self.amp_factor = float(amp_factor)
+        self.sample_rate = sample_rate
+        self.min_freq = min_freq
+        self.max_freq = max_freq
+        self.pre_stim_samples = pre_stim_samples
+        self.stim_samples = stim_samples
+        self.total_samples = total_samples
+        self.chunk_size = sample_rate  # 1-second chunks
+        self.stop_event = threading.Event()
+
+    def run(self):
+        chunk_size = self.chunk_size
+        current_phase = 0.0
+        chunks_written = 0
+        gradient = np.arange(chunk_size) / chunk_size
+        n_pre_buffer = 4
+        prev_play_freq = 0.0
+        self.ao_task.out_stream.output_buf_size = chunk_size * (n_pre_buffer + 2)
+
+        while not self.stop_event.is_set():
+            current_sample = chunks_written * chunk_size
+            if current_sample >= self.total_samples:
+                break
+
+            if current_sample < self.pre_stim_samples:
+                chunk = np.zeros(chunk_size, dtype=np.float64)
+                current_phase = 0.0
+            elif current_sample >= self.pre_stim_samples + self.stim_samples:
+                chunk = np.zeros(chunk_size, dtype=np.float64)
+                current_phase = 0.0
+            else:
+                buf_data = np.array(self.plot_buffer[0])
+                if buf_data.size > 0:
+                    expected_fish_freq = prev_play_freq - self.clamp_offset if prev_play_freq > 0 else None
+                    fish_freq = compute_dominant_frequency(
+                        buf_data, self.sample_rate, self.min_freq, self.max_freq,
+                        hint_freq=expected_fish_freq,
+                        notch_freq=prev_play_freq if prev_play_freq > 0 else None
+                    )
+                else:
+                    fish_freq = 0.0
+                play_freq = fish_freq + self.clamp_offset
+                prev_play_freq = play_freq
+                t_local = np.arange(chunk_size) / self.sample_rate
+                stim_sample = current_sample - self.pre_stim_samples
+                if stim_sample == 0:
+                    amp_arr = self.amp_factor * gradient
+                elif stim_sample >= self.stim_samples - chunk_size:
+                    amp_arr = self.amp_factor * gradient[::-1]
+                else:
+                    amp_arr = np.full(chunk_size, self.amp_factor)
+                chunk = amp_arr * np.sin(2 * np.pi * play_freq * t_local + current_phase)
+                current_phase = (current_phase + 2 * np.pi * play_freq * chunk_size / self.sample_rate) % (2 * np.pi)
+
+            try:
+                self.ao_task.write(chunk, timeout=5.0)
+            except Exception:
+                break
+            chunks_written += 1
+
+            if chunks_written == n_pre_buffer:
+                self.ao_task.start()
+
+            if chunks_written > n_pre_buffer:
+                time.sleep(chunk_size / self.sample_rate * 0.8)
+
+    def stop(self):
+        self.stop_event.set()
+
+
 # ---------------- Frequency Confirmation Dialog ----------------
 class FrequencyConfirmDialog(QtWidgets.QDialog):
-    def __init__(self, dominant_freq, offset_frequency, plot_buffer, sample_rate, min_freq, max_freq, hint_freq, parent=None):
+    def __init__(self, dominant_freq, offset_frequency, plot_buffer, sample_rate, min_freq, max_freq, hint_freq,
+                 mode='Static', start_offset=0, end_offset=0, clamp_offset=0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Confirm Playback Frequencies")
         self.setModal(True)
@@ -528,6 +636,10 @@ class FrequencyConfirmDialog(QtWidgets.QDialog):
         self.min_freq = min_freq
         self.max_freq = max_freq
         self.hint_freq = hint_freq
+        self.mode = mode
+        self.start_offset = start_offset
+        self.end_offset = end_offset
+        self.clamp_offset = clamp_offset
         self.confirmed_freq = dominant_freq
 
         layout = QtWidgets.QVBoxLayout()
@@ -554,15 +666,31 @@ class FrequencyConfirmDialog(QtWidgets.QDialog):
         layout.addLayout(btn_layout)
 
         self.setLayout(layout)
-        self.resize(360, 140)
+        self.resize(420, 170)
 
     def _update_label(self):
-        playback_freq = self.confirmed_freq + self.offset_frequency
-        self.info_label.setText(
-            f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
-            f"Playback frequency:    {playback_freq:.1f} Hz  "
-            f"(offset: {self.offset_frequency:+.1f} Hz)"
-        )
+        if self.mode == 'Ramp':
+            f0 = self.confirmed_freq + self.start_offset
+            f1 = self.confirmed_freq + self.end_offset
+            self.info_label.setText(
+                f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+                f"Playback ramps:        {f0:.1f} Hz  \u2192  {f1:.1f} Hz\n"
+                f"(start offset: {self.start_offset:+.1f} Hz,  end offset: {self.end_offset:+.1f} Hz)"
+            )
+        elif self.mode == 'Freq. Clamp':
+            play_freq = self.confirmed_freq + self.clamp_offset
+            self.info_label.setText(
+                f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+                f"Clamp offset:          {self.clamp_offset:+.1f} Hz\n"
+                f"Initial playback:      {play_freq:.1f} Hz  (will track live)"
+            )
+        else:
+            playback_freq = self.confirmed_freq + self.offset_frequency
+            self.info_label.setText(
+                f"Detected fish EOD:     {self.confirmed_freq:.1f} Hz\n"
+                f"Playback frequency:    {playback_freq:.1f} Hz  "
+                f"(offset: {self.offset_frequency:+.1f} Hz)"
+            )
 
     def _refresh(self):
         data = np.array(list(self.plot_buffer[0]))
@@ -674,10 +802,28 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         exp_layout.addRow("Expected Fish Freq (Hz):", self.fishFreqEdit)
 
         # Playback Settings
+        self.playbackModeCombo = QtWidgets.QComboBox()
+        self.playbackModeCombo.addItems(["Static", "Ramp", "Freq. Clamp"])
+        exp_layout.addRow("Playback Mode:", self.playbackModeCombo)
         self.offsetCombo = QtWidgets.QComboBox()
         self.offsetCombo.addItems(["-200", "-100", "-20", "-10", "-5", "-2.5", "0", "2.5", "5", "10", "20", "100", "200"])
         self.offsetCombo.setCurrentText("0")
         exp_layout.addRow("Frequency Offset (Hz):", self.offsetCombo)
+        self.rampStartLabel = QtWidgets.QLabel("Ramp Start Offset (Hz):")
+        self.rampStartEdit = QtWidgets.QLineEdit("-200")
+        exp_layout.addRow(self.rampStartLabel, self.rampStartEdit)
+        self.rampEndLabel = QtWidgets.QLabel("Ramp End Offset (Hz):")
+        self.rampEndEdit = QtWidgets.QLineEdit("200")
+        exp_layout.addRow(self.rampEndLabel, self.rampEndEdit)
+        self.rampStartLabel.setVisible(False)
+        self.rampStartEdit.setVisible(False)
+        self.rampEndLabel.setVisible(False)
+        self.rampEndEdit.setVisible(False)
+        self.clampOffsetLabel = QtWidgets.QLabel("Clamp Offset (Hz):")
+        self.clampOffsetEdit = QtWidgets.QLineEdit("10")
+        exp_layout.addRow(self.clampOffsetLabel, self.clampOffsetEdit)
+        self.clampOffsetLabel.setVisible(False)
+        self.clampOffsetEdit.setVisible(False)
         self.preStimEdit = QtWidgets.QLineEdit("60")
         exp_layout.addRow("Pre-Stim Duration (s):", self.preStimEdit)
         self.stimEdit = QtWidgets.QLineEdit("60")
@@ -752,6 +898,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.resetBtn.clicked.connect(self.reset_device)
         self.closeBtn.clicked.connect(self.safe_close)
         self.audioOutputCheck.stateChanged.connect(self.toggle_audio_output)
+        self.playbackModeCombo.currentTextChanged.connect(self.on_playback_mode_changed)
         
         # Initial button states
         self.recordBtn.setEnabled(False)
@@ -945,6 +1092,20 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "font-size: 16px; font-weight: bold; padding: 5px; border-radius: 3px;"
         )
 
+    def on_playback_mode_changed(self, mode):
+        is_ramp = mode == "Ramp"
+        is_clamp = mode == "Freq. Clamp"
+        offset_label = self.expGroup.layout().labelForField(self.offsetCombo)
+        if offset_label:
+            offset_label.setVisible(not is_ramp and not is_clamp)
+        self.offsetCombo.setVisible(not is_ramp and not is_clamp)
+        self.rampStartLabel.setVisible(is_ramp)
+        self.rampStartEdit.setVisible(is_ramp)
+        self.rampEndLabel.setVisible(is_ramp)
+        self.rampEndEdit.setVisible(is_ramp)
+        self.clampOffsetLabel.setVisible(is_clamp)
+        self.clampOffsetEdit.setVisible(is_clamp)
+
     def start_record(self):
         """Start recording with synchronized playback stimulus."""
         self.recordBtn.setEnabled(False)
@@ -957,8 +1118,15 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             QtCore.QThread.msleep(50)
         
         fish_id = self.fishIdEdit.text().strip().replace('.', '-').replace(' ', '_') or "recording"
-        offset_str = self.offsetCombo.currentText().replace('.', 'p').replace('-', 'm')
-        default_name = f"{fish_id}_{offset_str}Hz.bin"
+        playback_mode = self.playbackModeCombo.currentText()
+        if playback_mode == "Ramp":
+            default_name = f"{fish_id}_ramp.bin"
+        elif playback_mode == "Freq. Clamp":
+            clamp_str = self.clampOffsetEdit.text().replace('.', 'p').replace('-', 'm')
+            default_name = f"{fish_id}_clamp{clamp_str}Hz.bin"
+        else:
+            offset_str = self.offsetCombo.currentText().replace('.', 'p').replace('-', 'm')
+            default_name = f"{fish_id}_{offset_str}Hz.bin"
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Playback Data", default_name, "Binary files (*.bin)")
         if not filepath:
             self.recordBtn.setEnabled(True)
@@ -969,8 +1137,22 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             pre_stim_duration = int(self.preStimEdit.text())
             stim_duration = int(self.stimEdit.text())
             post_stim_duration = int(self.postStimEdit.text())
-            offset_frequency = float(self.offsetCombo.currentText())
             amp_factor = float(self.ampFactorEdit.text())
+            if playback_mode == "Ramp":
+                start_offset = float(self.rampStartEdit.text())
+                end_offset = float(self.rampEndEdit.text())
+                offset_frequency = 0.0
+                clamp_offset = 0.0
+            elif playback_mode == "Freq. Clamp":
+                clamp_offset = float(self.clampOffsetEdit.text())
+                offset_frequency = 0.0
+                start_offset = 0.0
+                end_offset = 0.0
+            else:
+                offset_frequency = float(self.offsetCombo.currentText())
+                start_offset = 0.0
+                end_offset = 0.0
+                clamp_offset = 0.0
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Input Error", f"Invalid playback parameter: {e}")
             self.recordBtn.setEnabled(True)
@@ -995,7 +1177,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         # Confirm detected and playback frequencies with the user before starting
         dlg = FrequencyConfirmDialog(
             self.dominant_freq, offset_frequency, self.acq.plot_buffer,
-            self.sample_rate, self.min_freq, self.max_freq, hint_freq
+            self.sample_rate, self.min_freq, self.max_freq, hint_freq,
+            mode=playback_mode, start_offset=start_offset, end_offset=end_offset,
+            clamp_offset=clamp_offset
         )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             self.recordBtn.setEnabled(True)
@@ -1011,18 +1195,26 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "stim": stim_duration,
             "post_stim": post_stim_duration,
             "total_duration": total_duration,
+            "playback_mode": playback_mode,
             "offset_frequency": self.offsetCombo.currentText(),
+            "ramp_start_offset": start_offset,
+            "ramp_end_offset": end_offset,
+            "clamp_offset": clamp_offset,
             "amp_factor": self.ampFactorEdit.text(),
             "input_channel_text": self.inputChanEdit.text().strip(),
             "copy_channel_text": self.copyChanEdit.text().strip(),
         }
 
-        # Generate synthetic playback signal
-        playback_signal = generate_synthetic_signal(
-            self.dominant_freq, offset_frequency, pre_stim_duration, 
-            stim_duration, post_stim_duration, self.sample_rate, amp_factor
-        )
-        
+        # Generate synthetic playback signal (not used in Freq. Clamp mode)
+        if playback_mode == "Freq. Clamp":
+            playback_signal = None
+        else:
+            playback_signal = generate_synthetic_signal(
+                self.dominant_freq, offset_frequency, pre_stim_duration,
+                stim_duration, post_stim_duration, self.sample_rate, amp_factor,
+                mode=playback_mode.lower(), start_offset=start_offset, end_offset=end_offset
+            )
+
         # Setup recording
         self.acq.samples_to_save = int(rec_duration * self.acq.sample_rate)
         self.acq.acquired_samples = 0
@@ -1042,11 +1234,26 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         
         # Start recording indicator
         self.start_recording_indicator()
-        
+
         # Start playback
-        self.acq.start_playback(playback_signal, total_duration)
+        if playback_mode == "Freq. Clamp":
+            self.acq.start_playback(None, total_duration, mode='clamp')
+            self.clamp_thread = ClampPlaybackThread(
+                self.acq.ao_task, self.acq.plot_buffer, clamp_offset, amp_factor,
+                self.acq.sample_rate, self.min_freq, self.max_freq,
+                pre_stim_duration * self.acq.sample_rate,
+                stim_duration * self.acq.sample_rate,
+                total_duration * self.acq.sample_rate
+            )
+            self.clamp_thread.start()
+        else:
+            self.acq.start_playback(playback_signal, total_duration)
 
     def on_recording_complete(self):
+        if hasattr(self, 'clamp_thread') and self.clamp_thread is not None:
+            self.clamp_thread.stop()
+            self.clamp_thread.join(timeout=5)
+            self.clamp_thread = None
         if self.acq is not None:
             self.acq.stop_playback()
         if self.file_writer is not None:
@@ -1083,6 +1290,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Output_Channel": self.acq.output_channel if self.acq.output_channel else "N/A",
             "Recording_Start_Timestamp": timestamp_str,
             "Dominant_Frequency": getattr(self, 'dominant_freq', 'N/A'),
+            "Playback_Mode": self.log_data["playback_mode"],
             "Frequency_Offset": self.log_data["offset_frequency"],
             "Min_Frequency": self.min_freq,
             "Max_Frequency": self.max_freq,
@@ -1091,12 +1299,21 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Post_Stimulus_Duration": str(self.log_data["post_stim"]),
             "Amplitude_Factor": self.log_data["amp_factor"],
         }
+        if self.log_data["playback_mode"] == "Ramp":
+            log_out["Ramp_Start_Offset"] = self.log_data["ramp_start_offset"]
+            log_out["Ramp_End_Offset"] = self.log_data["ramp_end_offset"]
+        elif self.log_data["playback_mode"] == "Freq. Clamp":
+            log_out["Clamp_Offset"] = self.log_data["clamp_offset"]
         with open(log_filepath, 'w') as f:
             for key, value in log_out.items():
                 f.write(f"{key}: {value}\n")
 
     def stop_acquisition(self):
         self.stop_recording_indicator()
+        if hasattr(self, 'clamp_thread') and self.clamp_thread is not None:
+            self.clamp_thread.stop()
+            self.clamp_thread.join(timeout=5)
+            self.clamp_thread = None
         if self.file_writer is not None:
             self.file_writer.stop()
             self.file_writer.join(timeout=5)

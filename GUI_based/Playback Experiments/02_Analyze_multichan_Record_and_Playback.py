@@ -2,9 +2,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from tkinter import Tk, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
+from tkinter import Tk, Toplevel, filedialog, Button, Checkbutton, IntVar, DoubleVar, Entry, Label, Frame, messagebox
 import os
-from scipy.signal import detrend, hilbert, butter, filtfilt
+from scipy.signal import detrend, hilbert, butter, filtfilt, find_peaks, welch
 from scipy.ndimage import label as ndimage_label
 
 class AnalysisGUI:
@@ -23,9 +23,9 @@ class AnalysisGUI:
         self.noverlap = IntVar(value=9)  # Default noverlap
         # self.env_lp = IntVar(value=5)   # Default lowpass cutoff frequency
         self.bandpass_filter_flag = IntVar(value=1)
-        self.bandpass_width = IntVar(value=300)
-        self.lp_cutoff = IntVar(value=400)
-        self.hp_cutoff = IntVar(value=1200)
+        self.bandpass_width = IntVar(value=800)
+        # self.lp_cutoff = IntVar(value=400)
+        # self.hp_cutoff = IntVar(value=1200)
         self.freq_band = IntVar(value=50)
         self.log_data = None
         self.data = None
@@ -101,8 +101,16 @@ class AnalysisGUI:
 
         # Initialize plot
         self.fig, self.axes = plt.subplots(4, 1, figsize=(15, 8))
+        self.axes[1].sharex(self.axes[0])
+        self.axes[2].sharex(self.axes[0])
         self.canvas = None
         self.toolbar = None
+        # State for interactive time-window FFT selection
+        self._press_x = None
+        self._drag_span = None
+        self.cumulated_cleaned_data = None
+        self.time_axis = None
+        self._sample_rate = None
 
     def load_file(self):
         """Load the log file and data."""
@@ -314,18 +322,37 @@ class AnalysisGUI:
 
         return y
 
-    def compute_dominant_frequency(self, data, sample_rate, min_freq, max_freq):
+    def compute_dominant_frequency(self, data, sample_rate, min_freq, max_freq, stim_freq=None):
         """Compute the dominant frequency of a quasi-sinusoidal signal within specified bounds."""
-        # Compute FFT and frequency bins
         fft_result = np.fft.rfft(data)
         frequencies = np.fft.rfftfreq(len(data), d=1/sample_rate)
-        # Apply frequency bounds
-        valid_indices = np.where((frequencies >= min_freq) & (frequencies <= max_freq))
-        filtered_frequencies = frequencies[valid_indices]
-        filtered_fft_result = np.abs(fft_result[valid_indices])
-        # Find the frequency with the maximum FFT amplitude within the bounded range
-        dominant_freq = filtered_frequencies[np.argmax(filtered_fft_result)]
-        return dominant_freq
+
+        valid_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+        f = frequencies[valid_mask]
+        a = np.abs(fft_result[valid_mask])
+
+        if len(f) == 0:
+            return np.nan
+
+        # Build exclusion mask around known static stimulus frequency
+        # 2 Hz margin is generous given ~0.1 Hz FFT resolution at 40kHz/10s
+        if stim_freq is not None:
+            non_stim = np.abs(f - stim_freq) > 2.0
+        else:
+            non_stim = np.ones(len(f), dtype=bool)
+
+        # Find actual local spectral peaks (1% prominence filters noise floor)
+        peak_idxs, _ = find_peaks(a, prominence=np.max(a) * 0.01)
+        non_stim_peaks = [i for i in peak_idxs if non_stim[i]]
+
+        if non_stim_peaks:
+            return f[max(non_stim_peaks, key=lambda i: a[i])]
+
+        # Fallback: no distinct peak outside stim band — return max amplitude bin
+        if np.any(non_stim):
+            return f[non_stim][np.argmax(a[non_stim])]
+
+        return f[np.argmax(a)]  # last resort: ignore exclusion
 
     def calculate_envelope(self, data, sample_rate, lowpass_cutoff=5):
         # Hilbert Transform to compute the envelope
@@ -352,6 +379,8 @@ class AnalysisGUI:
         self.fm_events = None
         self.instant_freq = np.array([])
         self.instant_time = np.array([])
+        self._drag_span = None
+        self._press_x = None
         if hasattr(self, 'export_fm_button'):
             self.export_fm_button.config(state="disabled")
 
@@ -367,6 +396,11 @@ class AnalysisGUI:
         fish_id = self.log_data["Fish_ID"]
         fish_freq = float(self.log_data["Dominant_Frequency"])
         frequency_offset = self.log_data["Frequency_Offset"]
+        stimulus_freq = fish_freq + float(frequency_offset)
+        playback_mode = self.log_data.get("Playback_Mode", "Static")
+        ramp_start_offset = float(self.log_data.get("Ramp_Start_Offset", 0))
+        ramp_end_offset   = float(self.log_data.get("Ramp_End_Offset", 0))
+        clamp_offset      = float(self.log_data.get("Clamp_Offset", 0))
         try:
             temperature = float(self.log_data["Temperature"])
         except KeyError:
@@ -385,6 +419,7 @@ class AnalysisGUI:
         n_total = int(self.log_data["N_Input_Channels"])
         has_copy = self.log_data.get("Playback_Copy_Channel", "N/A") != "N/A"
         n_recording = n_total - (1 if has_copy else 0)
+        print(f"Channels: {n_total} total, {n_recording} recording, copy={'ch' + str(n_total-1) if has_copy else 'none'}, stimulus=ch{n_total-1}")
 
         # Stimulus is always the last channel
         stimulus = detrend(self.data[f"ch {n_total - 1}"])
@@ -415,7 +450,13 @@ class AnalysisGUI:
         self.axes[0].plot(time_axis, channel_1 + 2 * max_y, label="Raw Data")
         self.axes[0].plot(time_axis, cumulated_cleaned_data, label="Cleaned Data")
         # self.axes[0].plot(time_axis, envelope_cum, label="Envelope")
-        self.axes[0].set_title(f"Raw Data - Fish: {fish_id}, Freq. Offset: {frequency_offset} Hz, Temp.: {temperature} °C, Cond.: {conductivity} uS")
+        if playback_mode == "Ramp":
+            mode_str = f"Ramp: {ramp_start_offset:+.1f} → {ramp_end_offset:+.1f} Hz"
+        elif playback_mode == "Freq. Clamp":
+            mode_str = f"Freq. Clamp: {clamp_offset:+.1f} Hz"
+        else:
+            mode_str = f"Offset: {frequency_offset} Hz"
+        self.axes[0].set_title(f"Raw Data — Fish: {fish_id}, {mode_str}, Temp.: {temperature} °C, Cond.: {conductivity} µS")
         self.axes[0].set_ylabel("Amplitude")
         self.axes[0].legend(loc="lower left")
 
@@ -443,8 +484,17 @@ class AnalysisGUI:
         if self.bandpass_filter_flag.get():
             low_freq = round(float(self.log_data['Dominant_Frequency'])) - self.bandpass_width.get()/2
             high_freq = round(float(self.log_data['Dominant_Frequency'])) + self.bandpass_width.get()/2
-            low_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) - self.bandpass_width.get()/2
-            high_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) + self.bandpass_width.get()/2
+            if playback_mode == "Ramp":
+                sweep_lo = fish_freq + min(ramp_start_offset, ramp_end_offset)
+                sweep_hi = fish_freq + max(ramp_start_offset, ramp_end_offset)
+                low_freq_stim  = max(min_freq, sweep_lo - 50)
+                high_freq_stim = min(max_freq, sweep_hi + 50)
+            elif playback_mode == "Freq. Clamp":
+                low_freq_stim  = fish_freq + clamp_offset - self.bandpass_width.get() / 2
+                high_freq_stim = fish_freq + clamp_offset + self.bandpass_width.get() / 2
+            else:
+                low_freq_stim  = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) - self.bandpass_width.get()/2
+                high_freq_stim = round(float(self.log_data['Dominant_Frequency'])) + round(float(self.log_data['Frequency_Offset'])) + self.bandpass_width.get()/2
             
             # Filter fish signal
             cumulated_cleaned_data_filtered, fish_bandpass_applied = self.bandpass_filter(cumulated_cleaned_data, sample_rate, low_freq, high_freq)
@@ -478,6 +528,10 @@ class AnalysisGUI:
         self.instant_freq = instant_freq
         self.instant_time = instant_time
 
+        # Pre-stimulus baseline EOD frequency (more precise than log FFT value)
+        pre_stim_mask = instant_time < pre_stim_duration
+        baseline_fish_freq = float(np.median(instant_freq[pre_stim_mask])) if np.any(pre_stim_mask) else fish_freq
+
         # Filter stimulus instantaneous frequency to stimulus period only
         if len(instant_time_stim) > 0:
             stim_mask = np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]
@@ -490,15 +544,65 @@ class AnalysisGUI:
         
         # Plot instantaneous frequency (only if data exists)
         if len(instant_time) > 0:
-            self.axes[2].plot(instant_time, instant_freq,'.')
+            self.axes[2].plot(instant_time, instant_freq, '.', color='steelblue', markersize=2, label='Fish EOD')
         if len(instant_time_stim) > 0:
-            self.axes[2].plot(instant_time_stim, instant_freq_stim,'.')
-        
+            self.axes[2].plot(instant_time_stim, instant_freq_stim, '.', color='darkorange', markersize=2, label='Stim. copy')
+
         # Show warning if no data could be plotted
         if len(instant_time) == 0 and len(instant_time_stim) == 0:
             self.axes[2].text(0.5, 0.5, 'No zero crossings detected\nTry lowering the threshold or adjusting filter settings',
                             ha='center', va='center', transform=self.axes[2].transAxes,
                             fontsize=12, color='red')
+
+        # Mode-specific overlays and stats initialisation
+        ramp_crossing_time = np.nan
+        ramp_fish_at_crossing = np.nan
+        ramp_jar_at_crossing = np.nan
+        ramp_jar_rate = np.nan
+        clamp_max_jar = clamp_mean_jar = clamp_steady_jar = clamp_latency = np.nan
+
+        if playback_mode == "Ramp":
+            t_ramp = np.linspace(pre_stim_duration, pre_stim_duration + stim_duration, stim_duration * 10)
+            f_ramp = (fish_freq + ramp_start_offset) + (ramp_end_offset - ramp_start_offset) * np.linspace(0, 1, len(t_ramp))
+            self.axes[2].plot(t_ramp, f_ramp, 'r--', linewidth=1.5, label="Expected ramp", zorder=3)
+            if ramp_start_offset * ramp_end_offset < 0:
+                crossing_frac = abs(ramp_start_offset) / abs(ramp_end_offset - ramp_start_offset)
+                ramp_crossing_time = pre_stim_duration + crossing_frac * stim_duration
+                self.axes[2].axvline(ramp_crossing_time, color='r', linestyle=':', alpha=0.6, label="DF=0")
+                if len(instant_time) > 0:
+                    ramp_fish_at_crossing = float(np.interp(ramp_crossing_time, instant_time, instant_freq))
+                    ramp_jar_at_crossing = ramp_fish_at_crossing - baseline_fish_freq
+                    window_s = 10
+                    rate_mask = (instant_time >= ramp_crossing_time - window_s) & \
+                                (instant_time <= ramp_crossing_time + window_s)
+                    if np.sum(rate_mask) > 1:
+                        coeffs = np.polyfit(instant_time[rate_mask], instant_freq[rate_mask], 1)
+                        ramp_jar_rate = float(coeffs[0])
+            self.axes[2].legend(loc="upper right", fontsize=8)
+
+        elif playback_mode == "Freq. Clamp":
+            clamp_target = fish_freq + clamp_offset
+            self.axes[2].axhline(clamp_target, color='g', linestyle='--', linewidth=1.5,
+                                 label=f"Clamp target ({clamp_target:.1f} Hz)", zorder=3)
+            if len(instant_time) > 0:
+                stim_if_mask = (instant_time >= pre_stim_duration) & \
+                               (instant_time < pre_stim_duration + stim_duration)
+                stim_freqs = instant_freq[stim_if_mask]
+                stim_times = instant_time[stim_if_mask]
+                if len(stim_freqs) > 0:
+                    clamp_max_jar  = float(np.max(stim_freqs)  - baseline_fish_freq)
+                    clamp_mean_jar = float(np.mean(stim_freqs) - baseline_fish_freq)
+                    ss_mask = stim_times >= pre_stim_duration + stim_duration - 10
+                    ss_freqs = stim_freqs[ss_mask]
+                    clamp_steady_jar = float(np.mean(ss_freqs) - baseline_fish_freq) if len(ss_freqs) > 0 else np.nan
+                    above = stim_freqs > (baseline_fish_freq + 1.0)
+                    clamp_latency = float(stim_times[above][0] - pre_stim_duration) if np.any(above) else np.nan
+            self.axes[2].legend(loc="upper right", fontsize=8)
+
+        else:
+            if len(instant_time) > 0 or len(instant_time_stim) > 0:
+                self.axes[2].legend(loc="upper right", fontsize=8)
+
         self.axes[2].set_title("Instantaneous Frequency — click 'Detect FMs' to label events")
         self.axes[2].set_ylabel("Frequency (Hz)")
         self.axes[2].set_xlabel("Time (s)")
@@ -507,7 +611,6 @@ class AnalysisGUI:
         # Plot statistics
         frequency_band = self.freq_band.get()
         stim_samples = stim_duration * sample_rate
-        # dom_freq_fish = self.compute_dominant_frequency(cumulated_cleaned_data[0:pre_stim_samples], sample_rate, min_freq, max_freq)
 
         periods = {
             "Pre-Stimulus": (0, pre_stim_samples),
@@ -516,10 +619,25 @@ class AnalysisGUI:
             "Post-Stimulus": (pre_stim_samples + stim_samples, total_samples)
         }
 
-        stats = {}
+        stats = {"Dominant Freq (spectrogram)": {}, "Median Inst. Freq": {}}
+        # for period, (start, end) in periods.items():
+        #     dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
+
         for period, (start, end) in periods.items():
-            dom_freq = self.compute_dominant_frequency(cumulated_cleaned_data[start:end], sample_rate, max(1, fish_freq-frequency_band), fish_freq+frequency_band)
-            
+            if playback_mode == "Ramp":
+                # Ramp smears stimulus power across a frequency band — no exclusion needed
+                dom_freq = self.compute_dominant_frequency(
+                    cumulated_cleaned_data[start:end], sample_rate,
+                    max(1, fish_freq - frequency_band), fish_freq + frequency_band
+                )
+            else:
+                # Static or Freq. Clamp: stimulus is a fixed sine — exclude it
+                dom_freq = self.compute_dominant_frequency(
+                    cumulated_cleaned_data[start:end], sample_rate,
+                    max(1, fish_freq - frequency_band), fish_freq + frequency_band,
+                    stim_freq=stimulus_freq
+                )
+
             # Calculate median instantaneous frequency if data exists
             if len(instant_time) > 0:
                 period_mask = (instant_time >= start / sample_rate) & (instant_time < end / sample_rate)
@@ -527,15 +645,26 @@ class AnalysisGUI:
                 freq_median = np.median(period_freqs) if len(period_freqs) > 0 else np.nan
             else:
                 freq_median = np.nan
-            
-            # temp = temperature
-            # cond = conductivity
-            # amp_cov_cum = np.abs(np.std(cumulated_cleaned_data[start:end]) / np.mean(cumulated_cleaned_data[start:end]))
-            # envelope_cum_period = detrend(envelope_cum[start:end])+1
-            # envelope_cov = np.std(envelope_cum_period) #/np.mean(envelope_cum))
-            stats[period] = (dom_freq, freq_median)#, amp_cov_ch1, amp_cov_ch2, envelope_cov
 
-        stats_df = pd.DataFrame(stats, index=["Dominant Freq (spectrogram)", "Median Inst. Freq"]) #"Amp. CoV (envelope)","Amp. CoV (Ch 1)", "Amp. CoV (Ch 2)",
+            stats["Dominant Freq (spectrogram)"][period] = round(dom_freq, 2)
+            stats["Median Inst. Freq"][period] = round(float(freq_median), 2) if not np.isnan(freq_median) else "N/A"
+
+        def _fmt(v):
+            return "N/A" if (isinstance(v, float) and np.isnan(v)) else round(float(v), 2)
+
+        if playback_mode == "Ramp" and not np.isnan(ramp_crossing_time):
+            blank = {p: "-" for p in periods}
+            stats["Crossing Time (s)"]    = {**blank, "Complete Stimulus": _fmt(ramp_crossing_time - pre_stim_duration)}
+            stats["JAR at Crossing (Hz)"] = {**blank, "Complete Stimulus": _fmt(ramp_jar_at_crossing)}
+            stats["JAR Rate (Hz/s)"]      = {**blank, "Complete Stimulus": _fmt(ramp_jar_rate)}
+        elif playback_mode == "Freq. Clamp":
+            blank = {p: "-" for p in periods}
+            stats["Max JAR (Hz)"]          = {**blank, "Complete Stimulus": _fmt(clamp_max_jar)}
+            stats["Mean JAR (Hz)"]         = {**blank, "Complete Stimulus": _fmt(clamp_mean_jar)}
+            stats["Steady-state JAR (Hz)"] = {**blank, "Complete Stimulus": _fmt(clamp_steady_jar)}
+            stats["JAR Latency (s)"]       = {**blank, "Complete Stimulus": _fmt(clamp_latency)}
+
+        stats_df = pd.DataFrame(stats).T
         stats_df = stats_df.round(2)
         self.axes[3].axis("off")
         table = self.axes[3].table(
@@ -568,6 +697,109 @@ class AnalysisGUI:
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
         self.toolbar.update()
         self.toolbar.pack(side="bottom", fill="x")
+
+        # Store data for interactive PSD selection and connect mouse events
+        self.cumulated_cleaned_data = cumulated_cleaned_data
+        self.time_axis = time_axis
+        self._sample_rate = sample_rate
+        self.canvas.mpl_connect('button_press_event', self._on_press)
+        self.canvas.mpl_connect('motion_notify_event', self._on_drag)
+        self.canvas.mpl_connect('button_release_event', self._on_release)
+
+    def _on_press(self, event):
+        if self.toolbar is not None and self.toolbar.mode != '':
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]):
+            return
+        self._press_x = event.xdata
+        if self._drag_span is not None:
+            try:
+                self._drag_span.remove()
+            except Exception:
+                pass
+            self._drag_span = None
+            self.canvas.draw_idle()
+
+    def _on_drag(self, event):
+        if self._press_x is None:
+            return
+        if self.toolbar is not None and self.toolbar.mode != '':
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]) or event.xdata is None:
+            return
+        if self._drag_span is not None:
+            try:
+                self._drag_span.remove()
+            except Exception:
+                pass
+        x0, x1 = sorted([self._press_x, event.xdata])
+        self._drag_span = self.axes[1].axvspan(x0, x1, alpha=0.3, color='yellow', zorder=10)
+        self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        if self._press_x is None:
+            return
+        if self.toolbar is not None and self.toolbar.mode != '':
+            self._press_x = None
+            return
+        if event.inaxes not in (self.axes[0], self.axes[1], self.axes[2]) or event.xdata is None:
+            self._press_x = None
+            return
+        t1, t2 = sorted([self._press_x, event.xdata])
+        self._press_x = None
+        if t2 - t1 < 0.1:  # ignore accidental clicks
+            return
+        self._show_psd_popup(t1, t2)
+
+    def _show_psd_popup(self, t1, t2):
+        if self.cumulated_cleaned_data is None or self.time_axis is None:
+            return
+        mask = (self.time_axis >= t1) & (self.time_axis <= t2)
+        segment = self.cumulated_cleaned_data[mask]
+        if len(segment) < 256:
+            messagebox.showwarning("Selection Too Short", "Selected window is too short for PSD analysis.")
+            return
+        fs = self._sample_rate
+        min_freq = float(self.log_data["Min_Frequency"])
+        max_freq = float(self.log_data["Max_Frequency"])
+        # nperseg targets ~0.5 Hz resolution; capped at segment length
+        nperseg = min(len(segment), 2 * fs)
+        freqs, psd = welch(segment, fs=fs, nperseg=nperseg, window='hann')
+        freq_mask = (freqs >= min_freq) & (freqs <= max_freq)
+
+        popup = Toplevel(self.root)
+        popup.title(f"PSD  —  {t1:.2f} s to {t2:.2f} s  ({t2 - t1:.2f} s)")
+        fig_psd, ax_psd = plt.subplots(figsize=(7, 4))
+        psd_plot = psd[freq_mask]
+        freqs_plot = freqs[freq_mask]
+        ax_psd.semilogy(freqs_plot, psd_plot, color='steelblue', linewidth=0.8)
+
+        # Mark the 3 most prominent peaks
+        peak_idxs, props = find_peaks(psd_plot, prominence=np.max(psd_plot) * 0.01)
+        if len(peak_idxs) > 0:
+            # Sort by prominence descending, take top 3
+            top_n = min(3, len(peak_idxs))
+            top_idxs = peak_idxs[np.argsort(props['prominences'])[::-1][:top_n]]
+            for idx in top_idxs:
+                fx = freqs_plot[idx]
+                py = psd_plot[idx]
+                ax_psd.plot(fx, py, 'o', color='red', markersize=8,
+                            markerfacecolor='none', markeredgewidth=1.5)
+                ax_psd.text(fx, py * 1.5, f"{fx:.2f} Hz",
+                            color='red', fontsize=8, ha='center', va='bottom')
+
+        ax_psd.set_xlabel("Frequency (Hz)")
+        ax_psd.set_ylabel("PSD (V²/Hz)")
+        ax_psd.set_title(f"Welch PSD: {t1:.2f}–{t2:.2f} s  (Δf ≈ {fs / nperseg:.2f} Hz)")
+        ax_psd.grid(True, alpha=0.3)
+        fig_psd.tight_layout()
+        canvas_psd = FigureCanvasTkAgg(fig_psd, master=popup)
+        canvas_psd.draw()
+        canvas_psd.get_tk_widget().pack(fill="both", expand=True)
+        toolbar_psd = NavigationToolbar2Tk(canvas_psd, popup)
+        toolbar_psd.update()
+        toolbar_psd.pack(side="bottom", fill="x")
+        popup.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig_psd), popup.destroy()))
 
     def detect_fms(self):
         if len(self.instant_freq) == 0 or len(self.instant_time) == 0:
@@ -634,7 +866,7 @@ class AnalysisGUI:
                 fm_type = "Type 3"
             elif peak_hz >= 100 and duration_ms <= 150:
                 fm_type = "Type 1"
-            elif peak_hz <= 50 and duration_ms <= 50 and abs(rise_fraction - 0.5) < 0.25:
+            elif peak_hz <= 100 and duration_ms <= 100 and abs(rise_fraction - 0.5) < 0.25:
                 fm_type = "Type 2"
             elif peak_hz <= 20 and duration_ms <= 50:
                 fm_type = "Rise"

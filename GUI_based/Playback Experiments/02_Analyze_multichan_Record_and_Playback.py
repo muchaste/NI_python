@@ -35,6 +35,8 @@ class AnalysisGUI:
         self.fm_events = None
         self.instant_freq = np.array([])
         self.instant_time = np.array([])
+        self.instant_freq_stim = np.array([])
+        self.instant_time_stim = np.array([])
 
         # Main layout: controls left, plot right
         main_frame = Frame(self.root)
@@ -379,6 +381,8 @@ class AnalysisGUI:
         self.fm_events = None
         self.instant_freq = np.array([])
         self.instant_time = np.array([])
+        self.instant_freq_stim = np.array([])
+        self.instant_time_stim = np.array([])
         self._drag_span = None
         self._press_x = None
         if hasattr(self, 'export_fm_button'):
@@ -537,6 +541,8 @@ class AnalysisGUI:
             stim_mask = np.where((instant_time_stim > pre_stim_duration) & (instant_time_stim < pre_stim_duration+stim_duration))[0]
             instant_freq_stim = instant_freq_stim[stim_mask]
             instant_time_stim = instant_time_stim[stim_mask]
+        self.instant_freq_stim = instant_freq_stim
+        self.instant_time_stim = instant_time_stim
 
         # zero_crossings = self.calculate_zero_crossings(cumulated_data, threshold)
         # instant_freq = sample_rate / np.diff(zero_crossings)
@@ -840,6 +846,16 @@ class AnalysisGUI:
 
             t_start = reg_time[idxs[0]]
             t_end = reg_time[idxs[-1]]
+            # Fish baseline frequency at FM onset (from the rolling median window)
+            baseline_freq_at_start = float(baseline[idxs[0]])
+            # Stimulus frequency at FM onset (NaN if outside stimulus period)
+            if (len(self.instant_time_stim) > 0
+                    and self.instant_time_stim[0] <= t_start <= self.instant_time_stim[-1]):
+                stim_freq_at_start = float(np.interp(t_start, self.instant_time_stim, self.instant_freq_stim))
+            else:
+                stim_freq_at_start = np.nan
+            # Difference: stimulus frequency minus fish baseline frequency at onset
+            delta_freq = stim_freq_at_start - baseline_freq_at_start if not np.isnan(stim_freq_at_start) else np.nan
             peak_local = int(np.argmax(deviation[idxs]))
             peak_idx = idxs[peak_local]
             peak_hz = float(deviation[peak_idx])
@@ -884,6 +900,9 @@ class AnalysisGUI:
                 "fall_time_ms": round(fall_time_ms, 2),
                 "rise_fraction": round(rise_fraction, 3),
                 "undershoot_hz": round(undershoot_hz, 3),
+                "stim_freq_at_start": round(stim_freq_at_start, 2) if not np.isnan(stim_freq_at_start) else np.nan,
+                "baseline_freq_at_start": round(baseline_freq_at_start, 2),
+                "delta_freq": round(delta_freq, 2) if not np.isnan(delta_freq) else np.nan,
                 "color": TYPE_COLORS.get(fm_type, "gray"),
             })
 
@@ -925,7 +944,8 @@ class AnalysisGUI:
         )
         if filepath:
             export_cols = ["type", "t_start", "t_end", "duration_ms", "peak_hz",
-                           "peak_time", "rise_time_ms", "fall_time_ms", "rise_fraction", "undershoot_hz"]
+                           "peak_time", "rise_time_ms", "fall_time_ms", "rise_fraction", "undershoot_hz",
+                           "stim_freq_at_start", "baseline_freq_at_start", "delta_freq"]
             pd.DataFrame(self.fm_events)[export_cols].to_csv(filepath, index=False)
 
 if __name__ == "__main__":

@@ -20,14 +20,15 @@ from scipy import signal
 from datetime import datetime
 
 # Get list of DAQ device names
-daqSys = nidaqmx.system.System()
-daqList = daqSys.devices.device_names
-if not daqList:
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    QtWidgets.QMessageBox.critical(None, "DAQ Error", "No DAQ detected, check connection.")
-    sys.exit(1)
+try:
+    daqSys = nidaqmx.system.System()
+    daqList = daqSys.devices.device_names
+    if not daqList:
+        daqList = []
+        print("Warning: No DAQ detected. GUI will launch but connection will not be possible.")
+except Exception as e:
+    daqList = []
+    print(f"Warning: NI-DAQmx not available ({e}). GUI will launch in demo mode.")
 
 # ---------------- Data Acquisition Module ----------------
 class DataAcquisition:
@@ -181,7 +182,6 @@ class DataAcquisition:
                 if self.recording_complete_callback is not None:
                     self.recording_complete_callback()
         return 0
-        return 0
 
 # ---------------- File Writing Module ----------------
 class FileWriter(threading.Thread):
@@ -215,7 +215,21 @@ class FileWriter(threading.Thread):
                 interleaved.tofile(f)
                 f.flush()
                 os.fsync(f.fileno())
-        print("FileWriter stopped.")
+
+            # Flush remaining data before exit
+            with self.buffer_lock:
+                min_len = min(len(buf) for buf in self.storage_buffer)
+                if min_len > 0:
+                    data_chunk = np.array([ [self.storage_buffer[ch].popleft() for _ in range(min_len)] for ch in range(len(self.storage_buffer)) ])
+                    n_samples = min_len
+                    time_vec = (acquired_samples + np.arange(n_samples)) * dt
+                    acquired_samples += n_samples
+                    interleaved = np.column_stack((time_vec, data_chunk.T))
+                    interleaved.tofile(f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    print(f"Flushed final {n_samples} samples to {os.path.basename(self.filepath)}")
+        print(f"FileWriter stopped. Total samples written: {acquired_samples}")
 
     def stop(self):
         self.stop_event.set()
@@ -242,7 +256,11 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.daqGroup = QtWidgets.QGroupBox("DAQ Settings")
         daq_layout = QtWidgets.QFormLayout()
         self.daqCombo = QtWidgets.QComboBox()
-        self.daqCombo.addItems(daqList)
+        if daqList:
+            self.daqCombo.addItems(daqList)
+        else:
+            self.daqCombo.addItem("[No DAQ Available]")
+            self.daqCombo.setEnabled(False)
         daq_layout.addRow("Select DAQ:", self.daqCombo)
         self.chanEdit = QtWidgets.QLineEdit("ai0")
         daq_layout.addRow("Input Channel:", self.chanEdit)
@@ -342,6 +360,21 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.recordBtn.clicked.connect(self.start_record)
         self.resetBtn.clicked.connect(self.reset_device)
         self.closeBtn.clicked.connect(self.safe_close)
+
+        # Disable controls if no DAQ available
+        if not daqList:
+            self.connectBtn.setEnabled(False)
+            self.resetBtn.setEnabled(False)
+
+        # Show warning if no DAQ detected
+        if not daqList:
+            QtCore.QTimer.singleShot(100, lambda: QtWidgets.QMessageBox.warning(
+                self, "No DAQ Detected",
+                "No DAQ device detected or NI-DAQmx drivers not installed.\n\n"
+                "The GUI will run in demo mode only. To enable data acquisition:\n"
+                "1. Install NI-DAQmx drivers\n"
+                "2. Connect a DAQ device\n"
+                "3. Restart the application"))
 
     def toggle_split_duration(self):
         self.splitDurEdit.setEnabled(self.splitFileCheck.isChecked())
@@ -466,6 +499,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         # File splitting logic - precise sample counting
         if getattr(self, 'split_enabled', False) and self.acq and self.acq.split_samples >= self.acq.target_split_samples:
             if self.next_split_idx < len(self.split_points):
+                print(f"\nFinalizing split file {self.split_counter}...")
+
                 # Stop current file writer
                 if self.file_writer is not None:
                     self.file_writer.stop()
@@ -479,6 +514,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
                 # Setup next split file
                 self.split_counter += 1
                 self.record_filepath = self._split_filename()
+
+                print(f"Starting split file {self.split_counter}...")
+
                 self.file_writer = FileWriter(self.acq.storage_buffer, self.buffer_lock, self.record_filepath, self.acq.sample_rate)
                 self.file_writer.start()
                 self.acq.logfile_written = False
@@ -512,6 +550,14 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.acq.logfile_written = False
         self.acq.logfile_callback = self.save_log_file
 
+        print("\n" + "="*60)
+        print("RECORDING STARTED")
+        print("="*60)
+        print(f"Recording ID: {self.recIdEdit.text() or 'N/A'}")
+        print(f"Duration: {rec_duration}s")
+        print(f"Sample Rate: {self.acq.sample_rate} Hz")
+        print(f"Channels: {self.acq.num_channels}")
+
         self.split_enabled = self.splitFileCheck.isChecked()
         if self.split_enabled:
             try:
@@ -529,6 +575,11 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             self.split_counter = 1
             self.base_filepath = os.path.splitext(filepath)[0]
             self.record_filepath = self._split_filename()
+
+            print(f"Split Mode: {self.split_duration}s per file")
+            print(f"Base Path: {os.path.basename(self.base_filepath)}")
+            print("="*60 + "\n")
+
             with open(self.record_filepath, 'wb'):
                 pass
             self.file_writer = FileWriter(self.acq.storage_buffer, self.buffer_lock, self.record_filepath, self.acq.sample_rate)
@@ -538,6 +589,10 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         else:
             self.acq.target_split_samples = 0  # No splitting
             self.record_filepath = filepath
+
+            print(f"Single File: {os.path.basename(filepath)}")
+            print("="*60 + "\n")
+
             with open(self.record_filepath, 'wb'):
                 pass
             self.file_writer = FileWriter(self.acq.storage_buffer, self.buffer_lock, self.record_filepath, self.acq.sample_rate)
@@ -547,12 +602,44 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         return f"{self.base_filepath}_{self.split_counter:03d}.bin"
 
     def on_recording_complete(self):
+        print("\n" + "="*60)
+        print("RECORDING COMPLETE - Finalizing files...")
+        print("="*60)
+
         if self.file_writer is not None:
             self.file_writer.stop()
             self.file_writer.join()
+
         self.acq.recording_start_timestamp = None
+
+        rec_id = self.recIdEdit.text() or "N/A"
+        rec_duration = self.recDurEdit.text()
+
+        if self.split_enabled:
+            num_files = self.split_counter
+            message = (
+                f"Recording Complete!\n\n"
+                f"Recording ID: {rec_id}\n"
+                f"Total Duration: {rec_duration}s\n"
+                f"Split Duration: {self.splitDurEdit.text()}s\n"
+                f"Files Created: {num_files}\n"
+                f"\nAll files saved successfully!"
+            )
+        else:
+            filename = os.path.basename(self.record_filepath)
+            message = (
+                f"Recording Complete!\n\n"
+                f"Recording ID: {rec_id}\n"
+                f"Duration: {rec_duration}s\n"
+                f"File: {filename}\n"
+                f"\nFile saved successfully!"
+            )
+
+        print("\n" + message)
+        print("="*60 + "\n")
+
         self.recordBtn.setEnabled(True)
-        QtWidgets.QMessageBox.information(self, "Finished", "Recording complete")
+        QtWidgets.QMessageBox.information(self, "Recording Complete", message)
 
     def save_log_file(self):
         log_filename = f"log_{os.path.basename(self.record_filepath).split('.')[0]}.txt"
@@ -595,8 +682,12 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
 
     def reset_device(self):
         dev = self.daqCombo.currentText()
+        if not dev:
+            QtWidgets.QMessageBox.warning(self, "No DAQ", "No DAQ device available to reset.")
+            return
         try:
             nidaqmx.system.Device(dev).reset_device()
+            QtWidgets.QMessageBox.information(self, "Success", f"Device {dev} reset successfully.")
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Error", str(e))
 

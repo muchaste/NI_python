@@ -55,9 +55,8 @@ class DataAcquisition:
         # One buffer per channel
         self.plot_buffer = [collections.deque(maxlen=int(plot_duration * self.sample_rate)) for _ in range(self.num_channels)]
         self.storage_buffer = [collections.deque() for _ in range(self.num_channels)]
-        # Buffer for DI samples and event log
-        self.di_buffer = collections.deque() if di_channel else None
         self.led_event_log = []  # List of (timestamp, state)
+        self._last_di_sample = None  # Last DI sample for cross-callback edge detection
 
         # --- Analog Input Task ---
         self.ai_task = nidaqmx.Task()
@@ -114,6 +113,7 @@ class DataAcquisition:
         self.session_start_timestamp = None
         self.split_samples = 0
         self.logfile_written = False
+        self._last_di_sample = None
         self.ai_task.start()
         if self.di_task:
             self.di_task.start()
@@ -158,37 +158,29 @@ class DataAcquisition:
         for ch_idx in range(self.num_channels):
             self.plot_buffer[ch_idx].extend(temp_data[ch_idx])
         # --- DI acquisition and event detection ---
-        if self.di_task and self.di_buffer is not None:
+        if self.di_task:
             try:
                 di_samples = self.di_task.read(number_of_samples_per_channel=temp_data.shape[1], timeout=0)
-                # di_samples: shape (n_samples,) or (1, n_samples)
                 if isinstance(di_samples, list) or isinstance(di_samples, np.ndarray):
                     if isinstance(di_samples, list):
                         di_samples = np.array(di_samples)
                     if di_samples.ndim > 1:
                         di_samples = di_samples[0]
-                    self.di_buffer.extend(di_samples)
-                    # Edge detection (rising/falling)
-                    arr = np.array(self.di_buffer)
-                    if arr.size > 1:
-                        # Only check new samples
-                        prev = arr[:-1]
-                        curr = arr[1:]
+                    # Prepend last sample from previous callback to detect cross-boundary edges
+                    if self._last_di_sample is not None:
+                        check = np.concatenate(([self._last_di_sample], di_samples))
+                        prev = check[:-1]
+                        curr = check[1:]
                         edges = np.where(prev != curr)[0]
-                        for idx in edges:
-                            # Timestamp relative to current split file start
-                            split_sample_idx = self.split_samples + idx - (arr.size - len(di_samples))
+                        for edge_i in edges:
+                            # edge_i=0 → transition into di_samples[0], sample index = split_samples + 0
+                            sample_idx = self.split_samples + edge_i
                             if self.recording_start_timestamp is not None:
-                                timestamp = self.recording_start_timestamp + split_sample_idx / self.sample_rate
+                                timestamp = self.recording_start_timestamp + sample_idx / self.sample_rate
                             else:
-                                # Fallback to current time if recording not started
                                 timestamp = time.time()
-                            state = int(curr[idx])
-                            self.led_event_log.append((timestamp, state))
-                    # Keep buffer short
-                    if len(self.di_buffer) > 1000:
-                        for _ in range(len(self.di_buffer) - 1000):
-                            self.di_buffer.popleft()
+                            self.led_event_log.append((timestamp, int(curr[edge_i])))
+                    self._last_di_sample = di_samples[-1]
             except Exception:
                 pass
         if self.recording_active:
@@ -262,13 +254,18 @@ class DataAcquisition:
         return 0
 
     def save_led_event_log(self, filepath):
-        """Save LED on/off event log to a CSV file."""
-        if not self.led_event_log:
-            return False
+        """Save LED on/off event log to a CSV file. Always writes header."""
         try:
+            # Remove exact duplicate (timestamp, state) entries while preserving order
+            seen = set()
+            deduped = []
+            for entry in self.led_event_log:
+                if entry not in seen:
+                    seen.add(entry)
+                    deduped.append(entry)
             with open(filepath, 'w') as f:
                 f.write('timestamp,state\n')
-                for ts, state in self.led_event_log:
+                for ts, state in deduped:
                     f.write(f'{ts:.6f},{state}\n')
             return True
         except Exception as e:
@@ -799,16 +796,12 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
 
     def _save_current_led_events(self):
         """Save LED event log for the current recording/split file."""
-        if self.acq and self.acq.di_channel and self.acq.led_event_log:
-            try:
-                led_log_path = os.path.splitext(self.record_filepath)[0] + '_led_events.csv'
-                success = self.acq.save_led_event_log(led_log_path)
-                if success:
-                    print(f"Saved LED events to {os.path.basename(led_log_path)} ({len(self.acq.led_event_log)} events)")
-                else:
-                    print(f"No LED events to save for {os.path.basename(self.record_filepath)}")
-            except Exception as e:
-                print(f"Error saving LED event log: {e}")
+        if self.acq and self.acq.di_channel:
+            led_log_path = os.path.splitext(self.record_filepath)[0] + '_led_events.csv'
+            n_events = len(self.acq.led_event_log)
+            success = self.acq.save_led_event_log(led_log_path)
+            if success:
+                print(f"Saved LED events to {os.path.basename(led_log_path)} ({n_events} events)")
 
     def on_recording_complete(self):
         print("\n" + "="*60)

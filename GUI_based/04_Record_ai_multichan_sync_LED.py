@@ -79,15 +79,22 @@ class DataAcquisition:
 
         # --- Digital Input Task (for LED sync detection) ---
         self.di_channel = di_channel
+        self._di_hw_timed = False
         if di_channel:
             self.di_task = nidaqmx.Task()
             self.di_task.di_channels.add_di_chan(di_channel)
-            # Synchronize DI sampling with AI sampling clock
-            self.di_task.timing.cfg_samp_clk_timing(
-                self.sample_rate,
-                source=f"/{di_channel.split('/')[0]}/ai/SampleClock",
-                sample_mode=constants.AcquisitionType.CONTINUOUS
-            )
+            # Try to synchronize DI sampling with AI clock (not supported on all devices)
+            try:
+                self.di_task.timing.cfg_samp_clk_timing(
+                    self.sample_rate,
+                    source=f"/{di_channel.split('/')[0]}/ai/SampleClock",
+                    sample_mode=constants.AcquisitionType.CONTINUOUS
+                )
+                self._di_hw_timed = True
+                print(f"DI mode: hardware-timed ({self.sample_rate} Hz, synchronized to AI clock)")
+            except nidaqmx.errors.DaqError as e:
+                self._di_hw_timed = False
+                print(f"DI mode: on-demand (device does not support hardware-timed DI: {e})")
         else:
             self.di_task = None
 
@@ -160,27 +167,33 @@ class DataAcquisition:
         # --- DI acquisition and event detection ---
         if self.di_task:
             try:
-                di_samples = self.di_task.read(number_of_samples_per_channel=temp_data.shape[1], timeout=0)
-                if isinstance(di_samples, list) or isinstance(di_samples, np.ndarray):
-                    if isinstance(di_samples, list):
-                        di_samples = np.array(di_samples)
-                    if di_samples.ndim > 1:
-                        di_samples = di_samples[0]
-                    # Prepend last sample from previous callback to detect cross-boundary edges
-                    if self._last_di_sample is not None:
-                        check = np.concatenate(([self._last_di_sample], di_samples))
-                        prev = check[:-1]
-                        curr = check[1:]
-                        edges = np.where(prev != curr)[0]
-                        for edge_i in edges:
-                            # edge_i=0 → transition into di_samples[0], sample index = split_samples + 0
-                            sample_idx = self.split_samples + edge_i
-                            if self.recording_start_timestamp is not None:
-                                timestamp = self.recording_start_timestamp + sample_idx / self.sample_rate
-                            else:
-                                timestamp = time.time()
-                            self.led_event_log.append((timestamp, int(curr[edge_i])))
-                    self._last_di_sample = di_samples[-1]
+                if self._di_hw_timed:
+                    di_samples = self.di_task.read(number_of_samples_per_channel=temp_data.shape[1], timeout=0)
+                    if isinstance(di_samples, list) or isinstance(di_samples, np.ndarray):
+                        if isinstance(di_samples, list):
+                            di_samples = np.array(di_samples)
+                        if di_samples.ndim > 1:
+                            di_samples = di_samples[0]
+                    else:
+                        di_samples = np.array([di_samples])
+                else:
+                    # On-demand: read single instantaneous sample per callback
+                    di_samples = np.array([int(self.di_task.read())])
+                # Prepend last sample from previous callback to detect cross-boundary edges
+                if self._last_di_sample is not None:
+                    check = np.concatenate(([self._last_di_sample], di_samples))
+                    prev = check[:-1]
+                    curr = check[1:]
+                    edges = np.where(prev != curr)[0]
+                    for edge_i in edges:
+                        # edge_i=0 → transition into di_samples[0], sample index = split_samples + 0
+                        sample_idx = self.split_samples + edge_i
+                        if self.recording_start_timestamp is not None:
+                            timestamp = self.recording_start_timestamp + sample_idx / self.sample_rate
+                        else:
+                            timestamp = time.time()
+                        self.led_event_log.append((timestamp, int(curr[edge_i])))
+                self._last_di_sample = int(di_samples[-1])
             except Exception:
                 pass
         if self.recording_active:
@@ -351,9 +364,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             self.daqCombo.addItem("[No DAQ Available]")
             self.daqCombo.setEnabled(False)
         daq_layout.addRow("Select DAQ:", self.daqCombo)
-        self.chanEdit = QtWidgets.QLineEdit("ai0")
+        self.chanEdit = QtWidgets.QLineEdit("ai0,ai1")
         daq_layout.addRow("Input Channel:", self.chanEdit)
-        self.sampleRateEdit = QtWidgets.QLineEdit("20000")
+        self.sampleRateEdit = QtWidgets.QLineEdit("100000")
         daq_layout.addRow("Sample Rate (Hz):", self.sampleRateEdit)
 
         # --- Add DO/DI channel dropdowns ---
@@ -389,7 +402,7 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         plot_layout = QtWidgets.QFormLayout()
         self.plotDurEdit = QtWidgets.QLineEdit("1")
         plot_layout.addRow("Plot Duration (s):", self.plotDurEdit)
-        self.refreshRateEdit = QtWidgets.QLineEdit("10")
+        self.refreshRateEdit = QtWidgets.QLineEdit("40")
         plot_layout.addRow("Refresh Rate (Hz):", self.refreshRateEdit)
         self.specMinEdit = QtWidgets.QLineEdit("100")
         plot_layout.addRow("Min Freq (Hz):", self.specMinEdit)

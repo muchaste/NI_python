@@ -108,6 +108,7 @@ class DataAcquisition:
         self.target_split_samples = 0  # Exact samples per split file
         self.logfile_written = False
         self.logfile_callback = None
+        self._periodic_blink_interval = 0  # In samples; 0 = disabled
 
     def set_led(self, state: bool):
         """Set the LED digital output (True=on, False=off)"""
@@ -210,7 +211,9 @@ class DataAcquisition:
                 if self.logfile_callback:
                     self.logfile_callback()
                 self.logfile_written = True
-            
+
+            prev_acquired = self.acquired_samples
+
             # Check if we need to limit samples to not exceed total recording duration
             if self.acquired_samples + n_samples > self.samples_to_save:
                 # Limit samples to exactly reach the target
@@ -256,10 +259,19 @@ class DataAcquisition:
                 for ch_idx in range(self.num_channels):
                     self.storage_buffer[ch_idx].extend(temp_data[ch_idx])
                 self.split_samples += n_samples
-                
+
                 # Update acquired samples
                 self.acquired_samples += n_samples
-                
+
+            # Periodic blink: fire LED directly from DAQ thread to minimize jitter
+            if self._periodic_blink_interval > 0:
+                crossed_minute = self.acquired_samples // self._periodic_blink_interval > prev_acquired // self._periodic_blink_interval
+                at_split = (self.target_split_samples > 0 and
+                            self.acquired_samples // self.target_split_samples > prev_acquired // self.target_split_samples)
+                if crossed_minute and not at_split:
+                    self.set_led(True)
+                    threading.Timer(0.200, self.set_led, [False]).start()
+
             if recording_complete:
                 self.recording_active = False
                 if self.recording_complete_callback is not None:
@@ -384,6 +396,12 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.fileSyncCheck.setToolTip("LED blinks N times at the start of file N (1 blink for file 1, 2 for file 2, etc.)")
         self.fileSyncCheck.setChecked(True)
         daq_layout.addRow(self.fileSyncCheck)
+        self.periodicBlinkCheck = QtWidgets.QCheckBox("Enable Periodic Sync Blinks")
+        self.periodicBlinkCheck.setToolTip("LED blinks once per interval to mark elapsed recording time. Suppressed when interval coincides with a file split boundary.")
+        self.periodicBlinkCheck.setChecked(False)
+        daq_layout.addRow(self.periodicBlinkCheck)
+        self.periodicBlinkIntervalEdit = QtWidgets.QLineEdit("60")
+        daq_layout.addRow("Periodic Blink Interval (s):", self.periodicBlinkIntervalEdit)
         self.daqGroup.setLayout(daq_layout)
         controls_layout.addWidget(self.daqGroup)
 
@@ -572,6 +590,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.specWindowEdit.setEnabled(False)
         self.doCombo.setEnabled(False)
         self.diCombo.setEnabled(False)
+        self.periodicBlinkCheck.setEnabled(False)
+        self.periodicBlinkIntervalEdit.setEnabled(False)
 
         self.acq = DataAcquisition(channel_list, sample_rate, -10, 10, refresh_rate, plot_duration,
                                    do_channel=do_channel_full, di_channel=di_channel_full)
@@ -579,6 +599,14 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             buf.clear()
         for buf in self.acq.storage_buffer:
             buf.clear()
+        if self.periodicBlinkCheck.isChecked():
+            try:
+                blink_interval_s = float(self.periodicBlinkIntervalEdit.text())
+            except ValueError:
+                blink_interval_s = 60.0
+            self.acq._periodic_blink_interval = int(blink_interval_s * sample_rate)
+        else:
+            self.acq._periodic_blink_interval = 0
         self.acq.start()
         interval = int(1000 / refresh_rate)
         self.plot_timer.start(interval)
@@ -907,6 +935,8 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
         self.specCheck.setEnabled(True)
         self.doCombo.setEnabled(True)
         self.diCombo.setEnabled(True)
+        self.periodicBlinkCheck.setEnabled(True)
+        self.periodicBlinkIntervalEdit.setEnabled(True)
 
     def reset_device(self):
         dev = self.daqCombo.currentText()

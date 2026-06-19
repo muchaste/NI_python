@@ -193,7 +193,7 @@ class DataAcquisition:
                             timestamp = self.recording_start_timestamp + sample_idx / self.sample_rate
                         else:
                             timestamp = time.time()
-                        self.led_event_log.append((timestamp, int(curr[edge_i])))
+                        self.led_event_log.append((timestamp, int(curr[edge_i]), sample_idx))
                 self._last_di_sample = int(di_samples[-1])
             except Exception:
                 pass
@@ -281,7 +281,7 @@ class DataAcquisition:
     def save_led_event_log(self, filepath):
         """Save LED on/off event log to a CSV file. Always writes header."""
         try:
-            # Remove exact duplicate (timestamp, state) entries while preserving order
+            di_resolution = 1 if self._di_hw_timed else self.sample_interval
             seen = set()
             deduped = []
             for entry in self.led_event_log:
@@ -289,9 +289,9 @@ class DataAcquisition:
                     seen.add(entry)
                     deduped.append(entry)
             with open(filepath, 'w') as f:
-                f.write('timestamp,state\n')
-                for ts, state in deduped:
-                    f.write(f'{ts:.6f},{state}\n')
+                f.write('timestamp,state,sample_idx,di_resolution\n')
+                for ts, state, sample_idx in deduped:
+                    f.write(f'{ts:.6f},{state},{sample_idx},{di_resolution}\n')
             return True
         except Exception as e:
             print(f"Error saving LED event log: {e}")
@@ -903,6 +903,12 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             timestamp_str = dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         else:
             timestamp_str = "N/A"
+        if self.acq.di_channel:
+            di_mode = "hardware-timed" if self.acq._di_hw_timed else "on-demand"
+            di_resolution = 1 if self.acq._di_hw_timed else self.acq.sample_interval
+        else:
+            di_mode = "N/A"
+            di_resolution = "N/A"
         log_data = {
             "N_Input_Channels": self.acq.num_channels,
             "Sample_Rate": self.acq.sample_rate,
@@ -910,7 +916,9 @@ class DataAcquisitionGUI(QtWidgets.QWidget):
             "Total_Recording_Duration": self.recDurEdit.text(),
             "Split_Recording_Duration": self.splitDurEdit.text() if self.splitFileCheck.isChecked() else "N/A",
             "Input_Channels": ', '.join(self.acq.input_channels),
-            "Recording_Start_Timestamp": timestamp_str
+            "Recording_Start_Timestamp": timestamp_str,
+            "DI_Mode": di_mode,
+            "DI_Resolution_samples": di_resolution
         }
         with open(log_filepath, 'w') as f:
             for key, value in log_data.items():

@@ -197,7 +197,7 @@ class DataAcquisition:
                         di_data = di_data[np.newaxis, :] # single channel: (1, n_samples)
                 else:
                     # On-demand: read single instantaneous sample per callback and channel
-                    raw = np.array([int(self.led_di_task.read())])
+                    raw = self.led_di_task.read()
                     if isinstance(raw, (list, np.ndarray)):
                         di_data = np.array([[int(v)] for v in raw])  # shape (num_di_channels, 1)
                     else:
@@ -223,7 +223,7 @@ class DataAcquisition:
                                 timestamp = self.recording_start_timestamp + sample_idx / self.sample_rate
                             else:
                                 timestamp = time.time()
-                            self.led_event_log.append((timestamp, int(curr[edge_i]), sample_idx))
+                            self.led_event_log.append((timestamp, int(curr[edge_i]), sample_idx, ch_idx))
                     self._last_di_sample[ch_idx] = int(ch_samples[-1])
             except Exception:
                 pass
